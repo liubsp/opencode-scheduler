@@ -1,0 +1,8 @@
+/.superpowers/
+/.tmp/
+/target/
+/node_modules/
+/dist/
+/bin/
+*.tgz
+*.log
