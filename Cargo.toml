@@ -1,0 +1,21 @@
+[package]
+name = "opencode-scheduler"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Durable one-shot prompt scheduling for OpenCode V2"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+
+[dev-dependencies]
+chrono-tz = "0.10"
+tempfile = "3"
+
+[profile.dev.package."*"]
+debug = false
