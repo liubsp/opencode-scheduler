@@ -2,28 +2,34 @@
 
 Durable, manual one-shot prompt scheduling for OpenCode V2, using a detached Rust daemon and CLI.
 
-## Private Windows pilot
+## Windows development installation
 
-Requires Rust to build and an already-running OpenCode service, version 2.2.0 or newer within major version 2. The scheduler reads OpenCode's service registration and authenticates directly; it does not change OpenCode configuration or restart its service.
+Requires Rust to build and OpenCode on PATH, version 2.2.0 or newer within major version 2. The scheduler reads OpenCode's service registration and authenticates directly. Creating or delivering a schedule may start OpenCode only when its registration is absent or its registered process is verified dead. It never restarts a live, unhealthy, incompatible or authentication-failing OpenCode service.
 
-Build and copy the executable into private application data:
+Build and install the global command into private application data:
 
 ```powershell
 cargo build
-.\target\debug\opencode-scheduler.exe install --json
-$scheduler = Join-Path $env:LOCALAPPDATA 'opencode-scheduler/app/bin/opencode-scheduler.exe'
-& $scheduler daemon start
-& $scheduler status
+.\target\debug\opencode-scheduler.exe install
 ```
 
-`install` does not start anything or change PATH. For an alternative data directory, set `OPENCODE_SCHEDULER_HOME` to an absolute private directory before installation and use its `app/bin/opencode-scheduler.exe`. An existing directory with unsafe ownership or permissions is rejected rather than silently weakened.
+Open a new terminal, then use the installed command:
+
+```powershell
+opencode-scheduler status
+opencode-scheduler daemon start
+```
+
+`install` adds the installed native executable directory (`app/bin`) to your user PATH, without replacing other entries. Commands run the executable directly, preserving literal prompt arguments without an intermediate command interpreter. Installation does not start an absent scheduler daemon. Upgrades stage the executable, stop only the authenticated scheduler daemon if running, preserve schedules and installation metadata, then restore its running state. A loaded old executable may remain as a private backup until a later installation can remove it.
+
+For an alternative data directory, set `OPENCODE_SCHEDULER_HOME` to an absolute private directory before installation and in terminals using it. An existing directory with unsafe ownership or permissions is rejected rather than silently weakened. `install --no-path` supports isolated installation or manual PATH management without changing your user PATH.
 
 ## Schedule a prompt
 
 ```powershell
 $at = (Get-Date).AddMinutes(5).ToString('o')
-& $scheduler schedule create --session ses_example --at $at --prompt 'Continue the task' --delivery steer
-& $scheduler schedule create --session-title 'Exact session title' --at $at --prompt 'Continue the task' --delivery queue
+opencode-scheduler schedule create --session ses_example --at $at --prompt 'Continue the task' --delivery steer
+opencode-scheduler schedule create --session-title 'Exact session title' --at $at --prompt 'Continue the task' --delivery queue
 ```
 
 Use either `--session` or `--session-title`, not both. Title matching is exact and service-wide: **every match gets a separate schedule**. The complete recipient set is validated and committed together. Later title changes do not change that set.
@@ -33,14 +39,14 @@ Use either `--session` or `--session-title`, not both. Title matching is exact a
 Create prints a request UUID to stderr before contacting the daemon. To recover a lost response, repeat the identical command with `--request-id <that UUID>`. This returns the original frozen batch, even if OpenCode is now offline; different input with the same UUID conflicts.
 
 ```powershell
-& $scheduler schedule list --json
-& $scheduler schedule show <schedule-id> --json
-& $scheduler schedule cancel <schedule-id> --json
-& $scheduler schedule log <schedule-id> --limit 50 --json
-& $scheduler daemon stop
+opencode-scheduler schedule list
+opencode-scheduler schedule show <schedule-id>
+opencode-scheduler schedule cancel <schedule-id>
+opencode-scheduler schedule log <schedule-id> --limit 50
+opencode-scheduler daemon stop
 ```
 
-`list` and `log` accept `--limit` (1–100) and `--cursor` from the previous page's `next_cursor`. `--json` returns the authenticated API's success/error envelope on stdout; errors exit nonzero. Human diagnostics go to stderr.
+Commands print readable summaries by default, including resolved dates, states, attempts and delivery errors. `list` and `log` accept `--limit` (1–100) and the `--cursor` printed with the previous page. For automation, optional `--json` returns the stable API success/error envelope on stdout. Errors exit nonzero; human diagnostics go to stderr.
 
 ## Delivery and limits
 
@@ -50,8 +56,8 @@ Create prints a request UUID to stderr before contacting the daemon. To recover 
 - Local list/show/cancel/log remain available while OpenCode is disconnected or a delivery is waiting on the network. `status` is read-only and never starts either service.
 - The daemon is singleton per data directory, bound to IPv4 loopback and protected by a private random token and instance ID. Windows launch uses no console and inherits no caller handles. `daemon stop` leaves schedules intact. There is no login/startup registration: start it manually after signing in.
 
-This is a private debug-build pilot, not a distributable release. The TypeScript plugin, absent-service bootstrap, release packaging/CI, extensive failure injection and supported non-Windows installation are deferred. If OpenCode is absent, start it normally; the scheduler reconnects on subsequent attempts. Keep the machine awake for on-time delivery; the scheduler does not wake it.
+This is a development installation, not yet a distributable release. The TypeScript plugin and release packaging/CI are separate completion work. Global registration is currently Windows-only; non-Windows installation is not runtime-certified. OpenCode bootstrap uses one supported `opencode api get /api/info` helper, bounded to 15 seconds; delivery still uses authenticated HTTP, not CLI prompt forwarding. Inconclusive process ownership fails visibly rather than replacing a service. Keep the machine awake for on-time delivery; the scheduler does not wake it.
 
-Validated on Windows with OpenCode service 2.2.5: timed prompt admission, same-message-ID retransmission, cancellation, scheduler stop/start recovery, message lookup, and delivery logs. Automated checks cover the durable core and detached CLI path (17 tests). Other service versions and live OpenCode restart recovery have not been runtime-certified. No provider or quota-management policy is implemented.
+The earlier Windows pilot was validated with OpenCode service 2.2.5: timed prompt admission, same-message-ID retransmission, cancellation, scheduler stop/start recovery, message lookup, and delivery logs. Automated fixtures additionally cover human output, isolated staged upgrades, PATH transformations and bounded bootstrap. The completed global installation and live bootstrap still require installed validation. Other service versions and live OpenCode restart recovery have not been runtime-certified. No provider or quota-management policy is implemented.
 
 MIT licensed.

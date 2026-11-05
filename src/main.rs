@@ -28,7 +28,11 @@ enum Command {
         command: DaemonCommand,
     },
     Status,
-    Install,
+    Install {
+        /// Install without changing the user's PATH (isolated/manual registration).
+        #[arg(long)]
+        no_path: bool,
+    },
     #[command(hide = true)]
     DaemonRun,
 }
@@ -88,11 +92,19 @@ async fn execute(cli: Cli) -> Result<Value, ApiError> {
             daemon::run(paths).await?;
             return Ok(json!({"ok":true}));
         }
-        Command::Install => {
-            runtime::install(&paths)?;
-            return Ok(
-                json!({"ok":true,"result":{"kind":"status","data":runtime::absent_status(&paths)}}),
-            );
+        Command::Install { no_path } => {
+            opencode_scheduler::install::install(&paths, !no_path).await?;
+            if !cli.json && !no_path {
+                eprintln!(
+                    "Global command installed. Open a new terminal to use opencode-scheduler."
+                );
+            }
+            return match runtime::discover_daemon(&paths).await? {
+                Some(endpoint) => runtime::rpc(&endpoint, &Operation::Status(EmptyInput {})).await,
+                None => Ok(
+                    json!({"ok":true,"result":{"kind":"status","data":runtime::absent_status(&paths)}}),
+                ),
+            };
         }
         Command::Status
         | Command::Daemon {
@@ -103,7 +115,6 @@ async fn execute(cli: Cli) -> Result<Value, ApiError> {
                     json!({"ok":true,"result":{"kind":"status","data":runtime::absent_status(&paths)}}),
                 );
             }
-            paths.prepare()?;
             return match runtime::discover_daemon(&paths).await? {
                 Some(endpoint) => runtime::rpc(&endpoint, &Operation::Status(EmptyInput {})).await,
                 None => Ok(
@@ -197,6 +208,7 @@ async fn execute(cli: Cli) -> Result<Value, ApiError> {
 async fn main() {
     let cli = Cli::parse();
     let json_output = cli.json;
+    let daemon_run = matches!(&cli.command, Command::DaemonRun);
     let value = match execute(cli).await {
         Ok(value) => value,
         Err(error) => {
@@ -204,6 +216,9 @@ async fn main() {
         }
     };
     let ok = value["ok"] == true;
+    if daemon_run && ok && !json_output {
+        return;
+    }
     if json_output {
         println!("{value}")
     } else if !ok {
@@ -214,31 +229,14 @@ async fn main() {
                 .as_str()
                 .unwrap_or("Scheduler operation failed.")
         );
-    } else if value["result"]["kind"] == "created" {
-        let data = &value["result"]["data"];
-        let schedules = data["schedules"].as_array().cloned().unwrap_or_default();
-        println!(
-            "Created {} schedule(s); request {}",
-            schedules.len(),
-            data["request_id"].as_str().unwrap_or_default()
-        );
-        for s in schedules {
-            println!(
-                "{}  {}  {}  {}",
-                s["id"].as_str().unwrap_or_default(),
-                s["target"]["session_id"].as_str().unwrap_or_default(),
-                s["time"]["display"].as_str().unwrap_or_default(),
-                s["delivery"].as_str().unwrap_or_default()
-            );
-        }
-        println!(
-            "Six attempts maximum; retries after 10/20/40/80/160 seconds. Overdue work runs when the daemon resumes. Admission is not agent completion; unconfirmed means it may have been accepted."
-        );
     } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value["result"]["data"]).unwrap_or_default()
-        );
+        match opencode_scheduler::output::render(&value) {
+            Ok(text) => print!("{text}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
     if !ok {
         std::process::exit(1)

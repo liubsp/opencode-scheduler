@@ -13,6 +13,234 @@ use std::{
 };
 use tempfile::TempDir;
 
+// These process-heavy chains share the host's bounded PowerShell startup budget.
+// Keep chains sequential; the singleton test still launches concurrent CLI starts itself.
+static CLI_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct DaemonCleanup(std::path::PathBuf);
+impl Drop for DaemonCleanup {
+    fn drop(&mut self) {
+        if self.0.join("endpoint.json").exists() {
+            let _ = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+                .env("OPENCODE_SCHEDULER_HOME", &self.0)
+                .args(["daemon", "stop", "--json"])
+                .output();
+        }
+    }
+}
+
+fn human(home: &TempDir, state: &TempDir, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+        .env("OPENCODE_SCHEDULER_HOME", home.path().join("private"))
+        .env("XDG_STATE_HOME", state.path())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !text.contains(['{', '}']),
+        "human output must not be JSON: {text}"
+    );
+    text
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn human_output_is_readable_for_all_operations() {
+    let _fixture = CLI_FIXTURES.lock().await;
+    // Catches accidentally sending the automation envelope to human stdout.
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let _cleanup = DaemonCleanup(home.path().join("private"));
+    let server = fixture(&state, Arc::new(Mutex::new(Vec::new()))).await;
+    let status = human(&home, &state, &["status"]);
+    assert!(status.contains("Daemon: not running"));
+    assert!(!home.path().join("private").exists());
+    let installed = human(&home, &state, &["install", "--no-path"]);
+    assert!(installed.contains("Binary: installed"));
+    let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let rid = uuid::Uuid::new_v4().to_string();
+    let args = [
+        "schedule",
+        "create",
+        "--session",
+        "ses_a",
+        "--at",
+        &at,
+        "--prompt",
+        "fixture",
+        "--request-id",
+        &rid,
+    ];
+    let created = human(&home, &state, &args);
+    let value = cli(&home, &state, &args);
+    let id = value["result"]["data"]["schedules"][0]["id"]
+        .as_str()
+        .unwrap();
+    for text in [
+        created,
+        human(&home, &state, &["schedule", "list"]),
+        human(&home, &state, &["schedule", "show", id]),
+    ] {
+        assert!(text.contains(id));
+        assert!(text.contains("ses_a"));
+        assert!(text.contains("pending"));
+        assert!(
+            text.contains(
+                value["result"]["data"]["schedules"][0]["time"]["display"]
+                    .as_str()
+                    .unwrap()
+            )
+        );
+        assert!(text.contains("0/6"));
+    }
+    assert!(human(&home, &state, &["schedule", "cancel", id]).contains("cancelled"));
+    let log = human(&home, &state, &["schedule", "log", id]);
+    assert!(log.contains(id) && log.contains("cancelled"));
+    human(&home, &state, &["daemon", "stop"]);
+    server.abort();
+}
+
+#[test]
+fn json_automation_contract_unchanged() {
+    use opencode_scheduler::types::OperationResult;
+    // Independent wire fixtures pin every existing result shape, not human renderer wording.
+    let schedule = json!({
+        "id":"2b8e5cb4-b18d-4a36-827d-cc941d8eb3a1","request_id":"df99554f-a8d4-4cf9-a20c-cc78a53415dd",
+        "created_at":"2026-11-06T00:00:00Z","time":{"due_at":"2026-11-07T01:30:00Z","original":"2026-11-07 02:30","display":"2026-11-07 02:30:00 +01:00","timezone":"Europe/Stockholm"},
+        "target":{"session_id":"ses_fixture","title":"Fixture"},"prompt":"fixture","delivery":"queue",
+        "message_id":"msg_f68959e33dfa45c3a397b77dd267a9aa","state":"pending","admitted_at":null,
+        "attempts_used":0,"next_attempt_at":"2026-11-07T01:30:00Z","certainty":"not_admitted","last_error":null,"lateness_ms":null
+    });
+    let mut summary = schedule.clone();
+    summary.as_object_mut().unwrap().remove("prompt");
+    for result in [
+        json!({"kind":"created","data":{"request_id":"df99554f-a8d4-4cf9-a20c-cc78a53415dd","schedules":[summary]}}),
+        json!({"kind":"schedule","data":schedule}),
+        json!({"kind":"page","data":{"items":[summary],"next_cursor":null}}),
+        json!({"kind":"cancel","data":{"schedule":schedule,"disposition":"cancelled"}}),
+        json!({"kind":"log","data":{"items":[{"seq":1,"schedule_id":"2b8e5cb4-b18d-4a36-827d-cc941d8eb3a1","ordinal":1,"started_at":"2026-11-07T01:30:00Z","finished_at":null,"phase":"discovery","outcome":"started","certainty":"not_admitted","error":null,"next_attempt_at":null}],"next_cursor":null}}),
+        json!({"kind":"stopping","data":{"accepted":true}}),
+    ] {
+        let parsed: OperationResult = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(
+            json!({"ok":true,"result":parsed}),
+            json!({"ok":true,"result":result})
+        );
+    }
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    assert_eq!(
+        cli(&home, &state, &["status"]),
+        json!({"ok":true,"result":{"kind":"status","data":{
+            "installed":{"binary":false,"plugin":false},
+            "daemon":{"reachable":false,"protocol_compatible":false},
+            "opencode":{"state":"unknown","service_version":null},
+            "schedules":{"pending":null,"blocked":null,"failed":null,"admission_unconfirmed":null}
+        }}})
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+        .env("OPENCODE_SCHEDULER_HOME", home.path().join("private"))
+        .args([
+            "schedule",
+            "create",
+            "--session",
+            "ses_a",
+            "--at",
+            "bad",
+            "--prompt",
+            "x",
+            "--request-id",
+            "bad",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({"ok":false,"error":{"code":"invalid_input","message":"Invalid scheduler input."}})
+    );
+    assert!(!home.path().join("private").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn install_preserves_store_and_handles_running_binary() {
+    let _fixture = CLI_FIXTURES.lock().await;
+    // Catches in-place copying over a loaded executable, lost metadata/store and daemon downtime.
+    let home = tempfile::Builder::new()
+        .prefix("scheduler install spaces ")
+        .tempdir()
+        .unwrap();
+    let state = TempDir::new().unwrap();
+    let _cleanup = DaemonCleanup(home.path().join("private"));
+    let server = fixture(&state, Arc::new(Mutex::new(Vec::new()))).await;
+    cli(&home, &state, &["install", "--no-path"]);
+    let root = home.path().join("private");
+    let mut metadata: Value =
+        serde_json::from_slice(&std::fs::read(root.join("install.json")).unwrap()).unwrap();
+    metadata["plugin"] = json!({"managed":"fixture"});
+    metadata["future_field"] = json!(["preserve"]);
+    std::fs::write(
+        root.join("install.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let created = cli(
+        &home,
+        &state,
+        &[
+            "schedule",
+            "create",
+            "--session",
+            "ses_a",
+            "--at",
+            &at,
+            "--prompt",
+            "preserve",
+        ],
+    );
+    let id = created["result"]["data"]["schedules"][0]["id"]
+        .as_str()
+        .unwrap();
+    let installed = root.join(if cfg!(windows) {
+        "app/bin/opencode-scheduler.exe"
+    } else {
+        "app/bin/opencode-scheduler"
+    });
+    let out = Command::new(&installed)
+        .env("OPENCODE_SCHEDULER_HOME", &root)
+        .env("XDG_STATE_HOME", state.path())
+        .args(["install", "--no-path", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        cli(&home, &state, &["status"])["result"]["data"]["daemon"]["reachable"],
+        true
+    );
+    assert_eq!(
+        cli(&home, &state, &["schedule", "show", id])["result"]["data"]["state"],
+        "pending"
+    );
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(root.join("install.json")).unwrap()).unwrap();
+    assert_eq!(after["plugin"], json!({"managed":"fixture"}));
+    assert_eq!(after["future_field"], json!(["preserve"]));
+    cli(&home, &state, &["daemon", "stop"]);
+    server.abort();
+}
+
 fn cli(home: &TempDir, state: &TempDir, args: &[&str]) -> Value {
     let out = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
         .env("OPENCODE_SCHEDULER_HOME", home.path().join("private"))
@@ -23,10 +251,62 @@ fn cli(home: &TempDir, state: &TempDir, args: &[&str]) -> Value {
         .unwrap();
     assert!(
         out.status.success(),
-        "{}",
+        "{args:?}: {} {}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bare_powershell_create_preserves_literal_prompt_arguments() {
+    let _fixture = CLI_FIXTURES.lock().await;
+    // Catches command-interpreter expansion of literal prompt text on the installed path.
+    let home = tempfile::Builder::new()
+        .prefix("scheduler literal spaces ")
+        .tempdir()
+        .unwrap();
+    let state = TempDir::new().unwrap();
+    let root = home.path().join("private");
+    let _cleanup = DaemonCleanup(root.clone());
+    let server = fixture(&state, Arc::new(Mutex::new(Vec::new()))).await;
+    cli(&home, &state, &["install", "--no-path"]);
+    let paths = opencode_scheduler::runtime::Paths { root: root.clone() };
+    assert!(paths.binary().exists());
+    assert!(!root.join("bin").exists());
+    let mut isolated_path = paths.command_dir().into_os_string();
+    isolated_path.push(";");
+    isolated_path.push(std::env::var_os("PATH").unwrap_or_default());
+    let prompt = "Keep %SCHEDULER_LITERAL_PROBE% and %MISSING_LITERAL_PROBE% literal; & | < > ^ ! ( ) $value `tick 'single' — åäö 日本語 with spaces";
+    let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let out = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            "if (@(Get-Command opencode-scheduler -CommandType Application)[0].Source -ne $env:SCHEDULER_TEST_BINARY) { throw 'Unexpected installed command' }; opencode-scheduler schedule create --session ses_a --at $env:SCHEDULER_TEST_AT --prompt $env:SCHEDULER_TEST_PROMPT --json; exit $LASTEXITCODE"])
+        .current_dir(home.path())
+        .env("OPENCODE_SCHEDULER_HOME", &root)
+        .env("XDG_STATE_HOME", state.path())
+        .env("PATH", isolated_path)
+        .env("SCHEDULER_LITERAL_PROBE", "expanded-by-cmd")
+        .env_remove("MISSING_LITERAL_PROBE")
+        .env("SCHEDULER_TEST_AT", at)
+        .env("SCHEDULER_TEST_BINARY", paths.binary())
+        .env("SCHEDULER_TEST_PROMPT", prompt)
+        .output().unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let created: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = created["result"]["data"]["schedules"][0]["id"]
+        .as_str()
+        .unwrap();
+    let stored = cli(&home, &state, &["schedule", "show", id]);
+    assert_eq!(stored["result"]["data"]["prompt"], prompt);
+    cli(&home, &state, &["daemon", "stop"]);
+    server.abort();
 }
 
 async fn fixture(state: &TempDir, posts: Arc<Mutex<Vec<Value>>>) -> tokio::task::JoinHandle<()> {
@@ -62,10 +342,12 @@ async fn fixture(state: &TempDir, posts: Arc<Mutex<Vec<Value>>>) -> tokio::task:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_detached_title_batch_frozen_create_show_cancel_log_and_delivery() {
+    let _fixture = CLI_FIXTURES.lock().await;
     // Catches partial title fanout, transport-dependent duplicate creation, non-detached launch,
     // missing auth, lost stable message identity and CLI/store bypasses through the real binary.
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _cleanup = DaemonCleanup(home.path().join("private"));
     let posts = Arc::new(Mutex::new(Vec::new()));
     let server = fixture(&state, posts.clone()).await;
     let absent = cli(&home, &state, &["status"]);

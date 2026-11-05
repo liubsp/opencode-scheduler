@@ -42,11 +42,14 @@ impl Paths {
     pub fn file(&self, name: &str) -> PathBuf {
         self.root.join(name)
     }
+    pub fn command_dir(&self) -> PathBuf {
+        self.file("app/bin")
+    }
     pub fn binary(&self) -> PathBuf {
-        self.file(if cfg!(windows) {
-            "app/bin/opencode-scheduler.exe"
+        self.command_dir().join(if cfg!(windows) {
+            "opencode-scheduler.exe"
         } else {
-            "app/bin/opencode-scheduler"
+            "opencode-scheduler"
         })
     }
     pub fn prepare(&self) -> Result<(), ApiError> {
@@ -62,7 +65,9 @@ impl Paths {
         {
             use std::os::windows::process::CommandExt;
             // Use the OS ACL implementation, not a second home-grown Windows security model.
-            let script = r#"$ErrorActionPreference='Stop'; $p=$env:SCHEDULER_PRIVATE_ROOT; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; if(!(Test-Path -LiteralPath $p)){New-Item -ItemType Directory -Path $p -Force | Out-Null; $a=New-Object Security.AccessControl.DirectorySecurity; $a.SetOwner($sid); $a.SetAccessRuleProtection($true,$false); $r=New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a}; $i=Get-Item -LiteralPath $p; if($i.Attributes -band [IO.FileAttributes]::ReparsePoint){exit 2}; $a=Get-Acl -LiteralPath $p; if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){exit 3}; foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -ne $sid.Value){exit 4}}"#;
+            // Supply the ACL at directory creation: a concurrent validator must never observe
+            // an intermediate inherited/public ACL between mkdir and Set-Acl.
+            let script = r#"$ErrorActionPreference='Stop'; $p=$env:SCHEDULER_PRIVATE_ROOT; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; if(!(Test-Path -LiteralPath $p)){$a=New-Object Security.AccessControl.DirectorySecurity; $a.SetOwner($sid); $a.SetAccessRuleProtection($true,$false); $r=New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $a.AddAccessRule($r); $d=New-Object IO.DirectoryInfo($p); $d.Create($a)}; $i=Get-Item -LiteralPath $p; if($i.Attributes -band [IO.FileAttributes]::ReparsePoint){exit 2}; $a=Get-Acl -LiteralPath $p; if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){exit 3}; foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -ne $sid.Value){exit 4}}"#;
             let mut child = Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", script])
                 .env("SCHEDULER_PRIVATE_ROOT", &self.root)
@@ -304,18 +309,4 @@ pub async fn rpc(endpoint: &Endpoint, operation: &Operation) -> Result<Value, Ap
 }
 pub fn absent_status(paths: &Paths) -> Value {
     json!({"installed":{"binary":paths.binary().exists(),"plugin":false},"daemon":{"reachable":false,"protocol_compatible":false},"opencode":{"state":"unknown","service_version":null},"schedules":{"pending":null,"blocked":null,"failed":null,"admission_unconfirmed":null}})
-}
-pub fn install(paths: &Paths) -> Result<(), ApiError> {
-    paths.prepare()?;
-    let binary = paths.binary();
-    fs::create_dir_all(binary.parent().ok_or_else(ApiError::storage)?)
-        .map_err(|_| ApiError::storage())?;
-    let current = std::env::current_exe().map_err(|_| ApiError::storage())?;
-    if current != binary {
-        fs::copy(current, &binary).map_err(|_| ApiError::storage())?;
-    }
-    write_json(
-        &paths.file("install.json"),
-        &json!({"binary":binary,"plugin":null,"data_home":paths.root}),
-    )
 }

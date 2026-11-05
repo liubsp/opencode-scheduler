@@ -24,6 +24,7 @@ pub struct Adapter {
     client: Client,
     record_path: PathBuf,
     record: Option<Record>,
+    discovery_transport_failed: bool,
 }
 #[derive(Clone, Deserialize)]
 struct Record {
@@ -106,14 +107,15 @@ impl Adapter {
                 .map_err(|_| unavailable())?,
             record_path,
             record: None,
+            discovery_transport_failed: false,
         })
     }
-    async fn request(
+    async fn response(
         &self,
         method: Method,
         path: &str,
         body: Option<Value>,
-    ) -> Result<(StatusCode, Value), ApiError> {
+    ) -> Result<reqwest::Response, ApiError> {
         let record = self.record.as_ref().ok_or_else(unavailable)?;
         let base = local_url(&record.url, false)?;
         let mut request = self
@@ -136,19 +138,37 @@ impl Adapter {
         if status.is_redirection() {
             return Err(unsupported());
         }
-        let value = bounded_json(response, 8 * 1024 * 1024).await?;
-        Ok((status, value))
+        Ok(response)
+    }
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(StatusCode, Value), ApiError> {
+        let response = self.response(method, path, body).await?;
+        let status = response.status();
+        Ok((status, bounded_json(response, 8 * 1024 * 1024).await?))
     }
     async fn probe(&mut self) -> Result<ServiceInfo, ApiError> {
+        self.discovery_transport_failed = false;
         let bytes = crate::runtime::read_bounded(&self.record_path, 64 * 1024)
             .map_err(|_| unavailable())?;
         let record: Record = serde_json::from_slice(&bytes).map_err(|_| unsupported())?;
         local_url(&record.url, false)?;
         self.record = Some(record.clone());
-        let (status, value) = self.request(Method::GET, "/api/info", None).await?;
+        let response = match self.response(Method::GET, "/api/info", None).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.discovery_transport_failed = error.code == "opencode_unavailable";
+                return Err(error);
+            }
+        };
+        let status = response.status();
         if !status.is_success() {
             return Err(unavailable());
         }
+        let value = bounded_json(response, 8 * 1024 * 1024).await?;
         let info: ServiceInfo = serde_json::from_value(value).map_err(|_| unsupported())?;
         let version = semver::Version::parse(&info.version).map_err(|_| unsupported())?;
         if version.major != 2
@@ -162,22 +182,53 @@ impl Adapter {
         Ok(info)
     }
     pub async fn discover(&mut self) -> Result<ServiceInfo, ApiError> {
-        // Read registration every cycle. One rediscovery handles registration/auth rotation;
-        // never replace a running incompatible or unresponsive OpenCode service.
-        match self.probe().await {
-            Ok(info) => Ok(info),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "authentication_failure" | "opencode_unavailable"
-                ) =>
-            {
-                self.probe().await
-            }
-            Err(error) => Err(error),
+        // Observation only, including status. Registration/auth rotation is read each cycle.
+        self.probe().await
+    }
+    async fn ensure(&mut self) -> Result<ServiceInfo, ApiError> {
+        self.ensure_with(
+            crate::bootstrap::command(),
+            Duration::from_secs(15),
+            crate::bootstrap::verified_dead,
+        )
+        .await
+    }
+    async fn ensure_with(
+        &mut self,
+        command: tokio::process::Command,
+        bound: Duration,
+        verified_dead: fn(u32) -> bool,
+    ) -> Result<ServiceInfo, ApiError> {
+        let error = match self.discover().await {
+            Ok(info) => return Ok(info),
+            Err(error) => error,
+        };
+        if error.code != "opencode_unavailable" {
+            return Err(error);
         }
-        // shortcut: this private pilot requires an already-running OpenCode service; bounded
-        // absent-service bootstrap is deferred until its process-lifetime contract is tested.
+        let eligible = match std::fs::symlink_metadata(&self.record_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(meta)
+                if self.discovery_transport_failed
+                    && meta.is_file()
+                    && !meta.file_type().is_symlink() =>
+            {
+                crate::runtime::read_bounded(&self.record_path, 64 * 1024)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+                    .is_some_and(|record| {
+                        record.pid != 0
+                            && local_url(&record.url, false).is_ok()
+                            && verified_dead(record.pid)
+                    })
+            }
+            _ => false,
+        };
+        if !eligible {
+            return Err(error);
+        }
+        crate::bootstrap::run(command, bound).await?;
+        self.discover().await
     }
     async fn target(&self, id: &str) -> Result<Target, ApiError> {
         validate_session_id(id)?;
@@ -213,7 +264,7 @@ impl Adapter {
             .map_err(|_| unavailable())?
     }
     async fn resolve_inner(&mut self, selector: &TargetSelector) -> Result<Vec<Target>, ApiError> {
-        self.discover().await?;
+        self.ensure().await?;
         if let TargetSelector::Id(id) = selector {
             return Ok(vec![self.target(id).await?]);
         }
@@ -333,7 +384,7 @@ impl Adapter {
     }
     pub async fn reconcile(&mut self, intent: &AttemptIntent) -> AttemptResult {
         let result = tokio::time::timeout(Duration::from_secs(60), async {
-            self.discover().await?;
+            self.ensure().await?;
             self.evidence(intent).await
         })
         .await;
@@ -359,7 +410,7 @@ impl Adapter {
         let mut phase = AttemptPhase::Discovery;
         let mut certainty = intent.previous_certainty;
         let result=tokio::time::timeout(Duration::from_secs(60),async {
-            self.discover().await?;
+            self.ensure().await?;
             if intent.ordinal>1 || intent.previous_certainty==AdmissionCertainty::Unconfirmed {
                 phase=AttemptPhase::Reconcile;
                 if self.evidence(intent).await? {return Ok(true)}
@@ -433,6 +484,276 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
+
+    #[test]
+    fn bootstrap_fixture_process() {
+        let Some(dir) = std::env::var_os("SCHEDULER_BOOTSTRAP_FIXTURE") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(dir.join("calls"))
+            .unwrap();
+        writeln!(file, "{}", std::process::id()).unwrap();
+        if std::env::var_os("SCHEDULER_FIXTURE_FAIL").is_some() {
+            eprintln!("fixture-secret-must-not-escape");
+            std::process::exit(17);
+        }
+        if std::env::var_os("SCHEDULER_FIXTURE_OVERFLOW").is_some() {
+            println!("{}", "x".repeat(70 * 1024));
+        }
+        if let Some(record) = std::env::var_os("SCHEDULER_FIXTURE_RECORD") {
+            std::fs::write(dir.join("service.json"), record.to_str().unwrap()).unwrap();
+        }
+        if std::env::var_os("SCHEDULER_FIXTURE_HANG").is_some() {
+            println!("fixture-secret-must-not-escape");
+            std::thread::sleep(Duration::from_secs(120));
+        }
+    }
+
+    fn helper(
+        dir: &std::path::Path,
+        record: Option<&Value>,
+        hang: bool,
+    ) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "adapter::tests::bootstrap_fixture_process",
+                "--nocapture",
+            ])
+            .env("SCHEDULER_BOOTSTRAP_FIXTURE", dir);
+        if let Some(record) = record {
+            command.env("SCHEDULER_FIXTURE_RECORD", record.to_string());
+        }
+        if hang {
+            command.env("SCHEDULER_FIXTURE_HANG", "1");
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn bootstrap_only_for_absent_or_verified_dead_service() {
+        // Catches helpers replacing live/unhealthy/auth-failing/unsupported services, or
+        // failure to rediscover the newly written registration after a single bootstrap.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/api/info",
+            get(|| async {
+                Json(json!({"version":"2.2.5","pid":42,"urls":[],"paths":{"tmp":"fixture"}}))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let record = json!({"url":url,"pid":42,"version":"2.2.5"});
+        for dead in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            if dead {
+                std::fs::write(
+                    dir.path().join("service.json"),
+                    r#"{"url":"http://127.0.0.1:1","pid":42}"#,
+                )
+                .unwrap();
+            }
+            let mut adapter = Adapter::from_record(dir.path().join("service.json")).unwrap();
+            assert!(adapter.discover().await.is_err()); // observation never starts anything
+            assert!(!dir.path().join("calls").exists());
+            let info = adapter
+                .ensure_with(
+                    helper(dir.path(), Some(&record), false),
+                    Duration::from_secs(15),
+                    |_| true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(info.version, "2.2.5");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            adapter
+                .ensure_with(
+                    helper(dir.path(), Some(&record), false),
+                    Duration::from_secs(15),
+                    |_| true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        for (status, body, expected) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({}),
+                "opencode_unavailable",
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({}),
+                "authentication_failure",
+            ),
+            (
+                StatusCode::OK,
+                json!({"version":"3.0.0","pid":42,"urls":[],"paths":{"tmp":"fixture"}}),
+                "unsupported_service",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().route(
+                "/api/info",
+                get(move || {
+                    let body = body.clone();
+                    async move { (status, Json(body)) }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("service.json"),
+                json!({"url":url,"pid":42}).to_string(),
+            )
+            .unwrap();
+            let mut adapter = Adapter::from_record(dir.path().join("service.json")).unwrap();
+            let error = adapter
+                .ensure_with(
+                    helper(dir.path(), Some(&record), false),
+                    Duration::from_secs(15),
+                    |_| true,
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, expected);
+            assert!(!dir.path().join("calls").exists());
+            server.abort();
+        }
+        // A live PID or inconclusive ownership must also block bootstrap when HTTP is unreachable.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("service.json"),
+            json!({"url":"http://127.0.0.1:1","pid":std::process::id()}).to_string(),
+        )
+        .unwrap();
+        let mut adapter = Adapter::from_record(dir.path().join("service.json")).unwrap();
+        assert!(
+            adapter
+                .ensure_with(
+                    helper(dir.path(), Some(&record), false),
+                    Duration::from_secs(15),
+                    |_| false
+                )
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join("calls").exists());
+        // An unreadable/malformed registration is not evidence of a dead process.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("service.json"), "invalid").unwrap();
+        let mut adapter = Adapter::from_record(dir.path().join("service.json")).unwrap();
+        assert!(
+            adapter
+                .ensure_with(
+                    helper(dir.path(), Some(&record), false),
+                    Duration::from_secs(15),
+                    |_| true
+                )
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join("calls").exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_helper_is_bounded_secret_free_and_reaped_on_cancellation() {
+        // Catches an unbounded helper, leaked output or a child surviving cancellation.
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let error = crate::bootstrap::run(helper(dir.path(), None, true), Duration::from_secs(15))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_secs(14));
+        assert!(started.elapsed() < Duration::from_secs(18));
+        assert_eq!(
+            error.to_string(),
+            "opencode_unavailable: OpenCode service is unavailable."
+        );
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        let pid = calls.trim().parse::<u32>().unwrap();
+        #[cfg(windows)]
+        assert!(crate::bootstrap::verified_dead(pid));
+        #[cfg(not(windows))]
+        let _ = pid;
+        std::fs::remove_file(dir.path().join("calls")).unwrap();
+        let command = helper(dir.path(), None, true);
+        let task =
+            tokio::spawn(
+                async move { crate::bootstrap::run(command, Duration::from_secs(15)).await },
+            );
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(dir.path().join("calls"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        #[cfg(windows)]
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !crate::bootstrap::verified_dead(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        #[cfg(not(windows))]
+        let _ = pid;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_helper_failure_and_output_limits_are_private() {
+        for mode in ["SCHEDULER_FIXTURE_FAIL", "SCHEDULER_FIXTURE_OVERFLOW"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut command = helper(dir.path(), None, false);
+            command.env(mode, "1");
+            let error = crate::bootstrap::run(command, Duration::from_secs(15))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "opencode_unavailable: OpenCode service is unavailable."
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[tokio::test]
     async fn stable_id_lost_response_reconciles_without_second_post_and_callback_failure_never_sends()

@@ -3,7 +3,8 @@
 ## Scope and workflow
 
 - OpenCode V2 only. Verify the running service contract; the CLI and service versions may differ.
-- Deliver M1: manual one-shot prompt scheduling through a Rust background server, CLI, and thin plugin. Stop after installed validation for human pilot testing; do not build later milestones.
+- Complete M1: manual one-shot prompt scheduling through a Rust background server, globally installed CLI, and thin plugin, including distribution and installed validation. The human reauthorized the remaining M1 tasks after the initial CLI pilot; do not build later automatic-rule milestones without authorization.
+- Normal user commands are `opencode-scheduler ...` with human-readable output. Keep JSON as an optional automation interface, not the primary documented workflow.
 - Astra authors designs only. Use inherited Sol for planning, all reviews, implementation, testing, and administration.
 - Keep process documents under ignored `.superpowers/` and temporary work under ignored `.tmp/`.
 - Follow work through the real installed user-facing path. Report automated, installation, and live evidence separately.
