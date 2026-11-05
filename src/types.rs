@@ -443,6 +443,50 @@ pub struct ScheduleCounts {
     pub admission_unconfirmed: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdInput {
+    pub id: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogInput {
+    pub id: String,
+    #[serde(default = "default_page_limit")]
+    pub limit: u16,
+    pub cursor: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyInput {}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "op",
+    content = "input",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum Operation {
+    ScheduleCreate(CreateInput),
+    ScheduleList(PageInput),
+    ScheduleShow(IdInput),
+    ScheduleCancel(IdInput),
+    ScheduleLog(LogInput),
+    Status(EmptyInput),
+    DaemonStop(EmptyInput),
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum OperationResult {
+    Created(CreateResult),
+    Schedule(Schedule),
+    Page(Page<ScheduleSummary>),
+    Log(Page<DeliveryEvent>),
+    Cancel(CancelResult),
+    Status(serde_json::Value),
+    Stopping(serde_json::Value),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
