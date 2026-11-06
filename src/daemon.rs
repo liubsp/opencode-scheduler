@@ -1,5 +1,4 @@
 use crate::{
-    adapter::unavailable,
     api::Service,
     runtime::{Endpoint, Paths, private_file, write_json},
     types::*,
@@ -36,13 +35,14 @@ fn authorized(headers: &HeaderMap, endpoint: &Endpoint) -> bool {
             == Some(&endpoint.instance_id)
 }
 fn error_response(error: ApiError) -> Response {
+    let error = error.sanitized().unwrap_or_else(|_| ApiError::storage());
     let status = match error.code.as_str() {
         "authentication_failure" => 401,
         "unsupported_protocol" => 426,
         "missing_session" | "schedule_missing" => 404,
         "request_conflict" | "already_admitted" | "outcome_uncertain" => 409,
         "resource_limit" => 413,
-        "invalid_input" => 400,
+        "invalid_input" | "invalid_time" | "time_in_past" | "local_time_invalid" => 400,
         _ => 503,
     };
     (
@@ -51,6 +51,7 @@ fn error_response(error: ApiError) -> Response {
     )
         .into_response()
 }
+
 async fn health(State(state): State<StateData>, headers: HeaderMap) -> Response {
     if !authorized(&headers, &state.endpoint) {
         return error_response(ApiError::new(
@@ -81,7 +82,8 @@ async fn rpc(State(state): State<StateData>, request: Request) -> Response {
         Err(_) => return error_response(ApiError::invalid()),
     };
     match state.service.execute(operation).await {
-        Ok(result) => {
+        Ok(mut result) => {
+            result.canonicalize_errors();
             let data = match serde_json::to_vec(&json!({"ok":true,"result":result})) {
                 Ok(data) if data.len() <= 16 * 1024 * 1024 => data,
                 _ => {
@@ -133,19 +135,23 @@ pub async fn run(paths: Paths) -> Result<(), ApiError> {
     #[cfg(windows)]
     let _diagnostics = crate::launch::diagnostics(&paths.file("diagnostic.log"))?;
     let lifetime = private_file(&paths.file("daemon.lock"))?;
-    lifetime.try_lock_exclusive().map_err(|_| unavailable())?;
+    lifetime
+        .try_lock_exclusive()
+        .map_err(|_| ApiError::coded("daemon_startup_failure"))?;
     let service = Service::new(paths.clone())?;
     // Recovery is captured once before exposing the API or starting the live worker.
     let unfinished = service.store()?.unfinished(32)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|_| ApiError::coded("daemon_startup_failure"))?;
     let endpoint = Endpoint {
         protocol: 1,
         instance_id: Uuid::new_v4().to_string(),
         base_url: format!(
             "http://{}",
-            listener.local_addr().map_err(|_| unavailable())?
+            listener
+                .local_addr()
+                .map_err(|_| ApiError::coded("daemon_startup_failure"))?
         ),
         pid: std::process::id(),
         token: format!(
@@ -168,7 +174,7 @@ pub async fn run(paths: Paths) -> Result<(), ApiError> {
     let result = tokio::select! {
         _=service.stop.notified()=>Ok(()),
         result=&mut worker=>match result{Ok(result)=>result,Err(_)=>Err(ApiError::storage())},
-        _=&mut server=>Err(unavailable()),
+        _=&mut server=>Err(ApiError::coded("daemon_unavailable")),
     };
     service.stopping.store(true, Ordering::SeqCst);
     if !worker.is_finished()
@@ -191,4 +197,28 @@ pub async fn run(paths: Paths) -> Result<(), ApiError> {
     }
     drop(lifetime);
     result
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rpc_errors_have_recovery_hints_and_correct_safe_status() {
+        for (code, status, hint) in [
+            ("missing_session", 404, "ALL"),
+            ("invalid_time", 400, "2099-11-06T05:00:00+01:00"),
+            ("time_in_past", 400, "future"),
+            ("local_time_invalid", 400, "offset"),
+            ("timezone_unavailable", 503, "offset"),
+        ] {
+            let response = error_response(ApiError::new(code, "private SQL Bearer token"));
+            assert_eq!(response.status().as_u16(), status);
+            let bytes = to_bytes(response.into_body(), 2048).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(message.contains(hint));
+            assert!(!message.contains("Bearer"));
+        }
+    }
 }

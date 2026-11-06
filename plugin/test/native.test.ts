@@ -2,12 +2,90 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import childProcess, { execFile } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { SchedulerClient } from "../src/client.js";
 import { fixture, page } from "./fixture.js";
+
+test("native helper budget includes valid combined preparation, startup and post-start status", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await rm(join(f.home, "endpoint.json"));
+  const original = childProcess.execFile;
+  // Substitute only the external executable. Real execFile enforces the production timeout.
+  // Valid CLI stages: 14s preparation (<15), 27s startup (<30), 10s status (<35).
+  t.mock.method(
+    childProcess,
+    "execFile",
+    (binary: string, args: string[], options: any, callback: any) => {
+      assert.equal(binary, join(f.home, "missing-binary"));
+      assert.deepEqual(args, ["daemon", "start"]);
+      const script = `import {writeFileSync} from 'node:fs';
+      setTimeout(() => setTimeout(() => {
+        writeFileSync(process.argv[1], process.argv[2]);
+        setTimeout(() => process.exit(0), 10000);
+      }, 27000), 14000);`;
+      return original(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          script,
+          join(f.home, "endpoint.json"),
+          JSON.stringify(f.endpoint),
+        ],
+        options,
+        callback,
+      );
+    },
+  );
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const client = new SchedulerClient(f.configPath);
+  t.after(() => client.dispose());
+  assert.deepEqual(await client.call("schedule_list", {}), page);
+  assert.deepEqual(
+    f.requests.map((r) => r.path),
+    ["/v1/health", "/v1/rpc"],
+  );
+});
+
+test("failed start/status helper gives truthful status recovery without leaking stderr", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await rm(join(f.home, "endpoint.json"));
+  const original = childProcess.execFile;
+  t.mock.method(
+    childProcess,
+    "execFile",
+    (_binary: string, _args: string[], options: any, callback: any) =>
+      original(
+        process.execPath,
+        ["-e", "console.error('synthetic private stderr'); process.exit(1)"],
+        options,
+        callback,
+      ),
+  );
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const client = new SchedulerClient(f.configPath);
+  t.after(() => client.dispose());
+  await assert.rejects(
+    client.call("schedule_list", {}),
+    (error: Error) =>
+      error.message.includes("opencode-scheduler status") &&
+      error.message.includes("may already be running") &&
+      !error.message.includes("synthetic private stderr"),
+  );
+});
 
 test("configured native daemon start uses isolated data home; status and unload never start/stop it", async (t) => {
   const binary = fileURLToPath(
@@ -82,7 +160,6 @@ test("configured native daemon start uses isolated data home; status and unload 
   assert.equal(options.windowsHide, true);
   assert.equal(options.shell, false);
   assert.ok(options.signal instanceof AbortSignal);
-  assert.ok(options.timeout > 0 && options.timeout <= 20000);
   assert.ok(options.maxBuffer > 0 && options.maxBuffer <= 65536);
   client.dispose();
   const observer = new SchedulerClient(f.configPath);

@@ -1,6 +1,5 @@
 use clap::{Args, Parser, Subcommand};
 use opencode_scheduler::{
-    adapter::unavailable,
     daemon,
     runtime::{self, Paths},
     types::*,
@@ -10,8 +9,13 @@ use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(version, about = "Durable one-shot prompt scheduling for OpenCode V2")]
+#[command(
+    version,
+    about = "Durable one-shot prompt scheduling for OpenCode V2",
+    after_help = "Examples:\n  opencode-scheduler status\n  opencode-scheduler schedule create --session ses_example --at 5:00 --prompt 'Continue the task'\n  opencode-scheduler schedule list\n\nUse <command> --help for all arguments. Scheduling is manual, one-shot, and requires the machine to be awake; no wake or login startup registration is installed."
+)]
 struct Cli {
+    /// Return the structured API envelope on stdout instead of readable summaries (automation).
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -19,15 +23,19 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Manage one-shot prompts and inspect their delivery history.
     Schedule {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    /// Manage the private background scheduler (not the OpenCode service).
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Inspect installation, daemon, OpenCode service and counts; read-only, never starts services.
     Status,
+    /// Install/upgrade the global CLI and user PATH, preserving schedules and unrelated entries.
     Install {
         /// Install without changing the user's PATH (isolated/manual registration).
         #[arg(long)]
@@ -38,54 +46,86 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum DaemonCommand {
+    /// Start the scheduler and resume pending work; does not register login/startup tasks.
     Start,
+    /// Inspect service health and counts; read-only, does not start either service.
     Status,
+    /// Stop only the scheduler, preserving schedules; does not stop OpenCode or retract admission.
     Stop,
 }
 #[derive(Args)]
 struct Paging {
+    /// Maximum items in this page (1-100); list omits prompt bodies.
     #[arg(long, default_value_t = 50)]
     limit: u16,
+    /// Opaque continuation cursor printed by the previous page; pass unchanged.
     #[arg(long)]
     cursor: Option<String>,
 }
 #[derive(Subcommand)]
 enum ScheduleCommand {
+    /// Create an atomic batch; title selection freezes ALL exact matches at creation.
+    #[command(
+        after_help = "Time formats:\n  5:00, 05:00 or 05:00:30: next strictly future local occurrence, today or tomorrow.\n  'YYYY-MM-DD HH:MM[:SS]': explicit local date on the daemon host.\n  RFC 3339 with offset, e.g. 2099-11-06T05:00:00+01:00: explicit instant.\nLocal forms use the daemon host IANA timezone. DST gaps/overlaps require an explicit offset; no guessing. The full resolved date, offset and timezone are printed. The appointment must still be future at commit; validation does not roll it forward again.\n\nDelivery: steer admits immediately into the target session; queue waits in OpenCode's queue. Admission is not agent completion. Six total attempts use the same message ID, with 10/20/40/80/160 second waits after failures; restart does not reset the budget.\n\nExamples:\n  opencode-scheduler schedule create --session ses_example --at 5:00 --prompt 'Continue the task'\n  opencode-scheduler schedule create --session-title 'Exact title' --at '2099-11-06 05:00' --prompt 'Continue' --delivery queue\n\nA request UUID is printed before contacting the daemon. If the response is lost, repeat identical input with --request-id <printed-UUID>. Replay returns the original frozen batch before resolving the clock again, even on another day. Never use a new UUID as a blind retry."
+    )]
     Create {
+        /// Existing OpenCode session ID (ses...); mutually exclusive with --session-title.
         #[arg(
             long,
             required_unless_present = "session_title",
             conflicts_with = "session_title"
         )]
         session: Option<String>,
+        /// Exact, case-sensitive service-wide title: ALL matches receive separate schedules.
         #[arg(long, required_unless_present = "session", conflicts_with = "session")]
         session_title: Option<String>,
+        /// Appointment: clock H:MM[:SS], local YYYY-MM-DD HH:MM[:SS], or RFC 3339 with offset.
         #[arg(long)]
         at: String,
+        /// Literal prompt text, passed unchanged (nonblank; at most 65536 UTF-8 bytes).
         #[arg(long)]
         prompt: String,
+        /// OpenCode admission mode, not a guarantee of agent completion; see below.
         #[arg(long,default_value="steer",value_parser=["steer","queue"])]
         delivery: String,
+        /// UUID v4 retry identity; reuse only with identical input after a lost response.
         #[arg(long)]
         request_id: Option<String>,
     },
+    /// List schedules, states and attempts without prompt bodies; use --cursor for more.
     List {
         #[command(flatten)]
         page: Paging,
     },
+    /// Show one schedule's target, date and admission state; --json also includes the literal prompt.
     Show {
+        /// Schedule UUID from schedule list (not the creation request UUID).
         id: String,
     },
+    /// Cancel pending delivery; cannot retract admission or guarantee cancellation if uncertain.
     Cancel {
+        /// Schedule UUID from schedule list; cancellation is idempotent.
         id: String,
     },
+    /// Inspect delivery attempts, errors and uncertainty for one schedule.
+    #[command(
+        after_help = "There are six attempts maximum; waits are 10/20/40/80/160 seconds after each failed attempt completes. Automatic retries preserve the same message ID. There is no manual retry/reset command. Admitted means accepted by OpenCode, not agent completion; unconfirmed must not be treated as rejection."
+    )]
     Log {
+        /// Schedule UUID from schedule list (not a request UUID).
         id: String,
         #[command(flatten)]
         page: Paging,
     },
 }
 async fn execute(cli: Cli) -> Result<Value, ApiError> {
+    if let Command::Schedule {
+        command: ScheduleCommand::Create { at, .. },
+    } = &cli.command
+    {
+        // Only syntax is safe before replay lookup; clocks and past dates remain RPC-authoritative.
+        opencode_scheduler::time::validate_syntax(at)?;
+    }
     let paths = Paths::discover()?;
     let operation = match cli.command {
         Command::DaemonRun => {
@@ -138,7 +178,7 @@ async fn execute(cli: Cli) -> Result<Value, ApiError> {
             }
             paths.prepare()?;
             let Some(endpoint) = runtime::discover_daemon(&paths).await? else {
-                return Err(unavailable());
+                return Err(ApiError::coded("daemon_unavailable"));
             };
             let response = runtime::rpc(&endpoint, &Operation::DaemonStop(EmptyInput {})).await?;
             if response["ok"] == true {
@@ -151,7 +191,7 @@ async fn execute(cli: Cli) -> Result<Value, ApiError> {
                     }
                 })
                 .await
-                .map_err(|_| unavailable())?;
+                .map_err(|_| ApiError::coded("daemon_unavailable"))?;
             }
             return Ok(response);
         }
@@ -209,12 +249,19 @@ async fn main() {
     let cli = Cli::parse();
     let json_output = cli.json;
     let daemon_run = matches!(&cli.command, Command::DaemonRun);
-    let value = match execute(cli).await {
+    let mut value = match execute(cli).await {
         Ok(value) => value,
         Err(error) => {
             json!({"ok":false,"error":error.sanitized().unwrap_or_else(|_|ApiError::storage())})
         }
     };
+    if value["ok"] == false {
+        let error = serde_json::from_value::<ApiError>(value["error"].clone())
+            .ok()
+            .and_then(|error| error.sanitized().ok())
+            .unwrap_or_else(ApiError::storage);
+        value["error"] = json!(error);
+    }
     let ok = value["ok"] == true;
     if daemon_run && ok && !json_output {
         return;

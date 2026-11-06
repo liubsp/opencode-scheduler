@@ -26,18 +26,54 @@ const kinds: Record<string, string> = {
   status: "status",
 };
 const messages: Record<string, string> = {
-  invalid_input: "Invalid scheduler input.",
-  missing_session: "Target session does not exist.",
-  opencode_unavailable: "OpenCode service is unavailable.",
-  unsupported_service: "OpenCode service is unsupported.",
-  unsupported_protocol: "Scheduler protocol is unsupported.",
-  storage_failure: "Scheduler storage operation failed.",
-  authentication_failure: "Service authentication failed.",
-  schedule_missing: "Schedule does not exist.",
-  already_admitted: "Prompt is already admitted.",
-  outcome_uncertain: "Prompt admission is unconfirmed.",
-  request_conflict: "Request ID has different original input.",
-  resource_limit: "Scheduler resource limit exceeded.",
+  invalid_input:
+    "Invalid scheduler input. Hint: use opencode-scheduler <command> --help for required arguments, UUIDs and limits.",
+  invalid_time:
+    "Invalid --at time. Hint: use 5:00 or 05:00:30 (next local occurrence on the daemon host), '2099-11-06 05:00' (host local date), or 2099-11-06T05:00:00+01:00 (explicit offset).",
+  time_in_past:
+    "The resolved appointment is no longer in the future. Hint: choose a future date, e.g. 2099-11-06T05:00:00+01:00 (explicit offset). A clock is not rolled forward again after validation; check schedule list before changing a lost-response request.",
+  local_time_invalid:
+    "Local time is ambiguous or nonexistent at a DST transition. Hint: choose another time or supply an explicit offset, e.g. 2099-11-06T05:00:00+01:00, to specify the intended instant.",
+  timezone_unavailable:
+    "The daemon host's local timezone could not be resolved. Hint: use an explicit offset, e.g. 2099-11-06T05:00:00+01:00, or repair the host timezone configuration.",
+  missing_session:
+    "Target session does not exist. Hint: verify the session ID or exact title in OpenCode; --session-title selects ALL exact matches.",
+  opencode_unavailable:
+    "OpenCode service is unavailable. Hint: run opencode-scheduler status and verify OpenCode is reachable. For a lost create response, reuse the same request ID and identical input.",
+  unsupported_service:
+    "OpenCode service is unsupported. Hint: use OpenCode V2 service version 2.2.0 or newer within major version 2; the CLI version may differ from the service.",
+  unsupported_protocol:
+    "Scheduler protocol is unsupported. Hint: upgrade the CLI, daemon and plugin together using the reviewed installer; preserve existing schedules.",
+  storage_failure:
+    "Scheduler storage operation failed; the cause is unknown. Hint: check free disk space and private data-directory access, then inspect diagnostic.log locally and run opencode-scheduler status. Do not delete the database. Reuse the same request ID and identical input after a lost create response.",
+  storage_permission:
+    "Scheduler storage access was denied or is read-only. Hint: check data-directory ownership and write permissions for the current user; do not bypass private ACLs or delete the database.",
+  storage_full:
+    "Scheduler storage has no free space. Hint: free disk space on the data volume without deleting scheduler data, then check opencode-scheduler status. Reuse the same request ID and identical input for a lost create response.",
+  storage_busy:
+    "Scheduler storage is locked by another writer. Hint: close external database writers and check opencode-scheduler status; preserve the database. For a lost create response reuse the same request ID and identical input.",
+  private_directory_failure:
+    "Private data-directory preparation or security validation failed. Hint: check ownership, permissions and free disk space; use a real directory, not a link. Ensure PowerShell is available on Windows. Do not weaken ACLs or delete existing scheduler data.",
+  private_directory_timeout:
+    "Private data-directory security helper exceeded its startup deadline. Hint: check host load and PowerShell availability, then run opencode-scheduler status. Permissions were not bypassed; preserve scheduler data and reuse the same request ID and identical input for a lost create response.",
+  daemon_startup_failure:
+    "Scheduler daemon startup failed. Hint: inspect diagnostic.log locally and check private-directory access and free disk space; then run opencode-scheduler daemon start. Preserve scheduler data; reuse the same request ID and identical input for a lost create response.",
+  daemon_startup_timeout:
+    "Scheduler daemon startup exceeded its deadline. Hint: run opencode-scheduler status to see whether startup finished; inspect diagnostic.log locally if it did not. Reuse the same request ID and identical input for a lost create response.",
+  daemon_unavailable:
+    "Scheduler daemon connection failed; the operation may have been accepted. Hint: run opencode-scheduler status, then opencode-scheduler daemon start if absent. For create, reuse the same request ID and identical input; do not create a replacement request blindly.",
+  authentication_failure:
+    "Service authentication failed. Hint: verify the current user's OpenCode and scheduler registration and credentials; use the supported installer to repair registration. Do not bypass authentication or share credentials.",
+  schedule_missing:
+    "Schedule does not exist. Hint: run opencode-scheduler schedule list and use a schedule UUID from that list, not a request ID.",
+  already_admitted:
+    "Prompt is already admitted. Hint: cancellation cannot retract accepted work; inspect opencode-scheduler schedule show <id> and the target session. Admission does not mean agent completion.",
+  outcome_uncertain:
+    "Prompt admission is unconfirmed. Hint: inspect opencode-scheduler schedule log <id> and the target session before taking action. Cancellation cannot guarantee retraction; a new request could duplicate delivery.",
+  request_conflict:
+    "Request ID has different original input. Hint: replay with the same request ID and identical input. Use a new UUID only for an intentional separate appointment after checking schedule list.",
+  resource_limit:
+    "Scheduler resource limit exceeded. Hint: use --limit 1-100 for pages; reduce prompt size (maximum 65536 UTF-8 bytes) or narrow the target selection (maximum 100 recipients).",
 };
 class ClientError extends Error {}
 function fail(message: string): never {
@@ -263,17 +299,43 @@ async function start(config: Install, signal: AbortSignal): Promise<void> {
         env: { ...process.env, OPENCODE_SCHEDULER_HOME: config.data_home },
         windowsHide: true,
         shell: false,
-        timeout: 20000,
+        // The invoked CLI also performs a status RPC: 15s preparation + 30s startup
+        // + 35s RPC, with 5s for process launch/exit. Readiness alone is not CLI completion.
+        timeout: 85000,
         maxBuffer: 64 * 1024,
         signal,
         encoding: "utf8",
       },
       (error) =>
         error
-          ? reject(new ClientError("Scheduler daemon start failed."))
+          ? reject(
+              new ClientError(
+                "Scheduler start/status helper did not complete. Hint: run opencode-scheduler status; the daemon may already be running. Inspect diagnostic.log locally if it is absent.",
+              ),
+            )
           : resolve(),
     );
   });
+}
+
+function canonicalError(value: unknown): { code: string; message: string } {
+  if (
+    !object(value) ||
+    !keys(value, ["code", "message"]) ||
+    typeof value.code !== "string" ||
+    typeof value.message !== "string" ||
+    Buffer.byteLength(value.message) < 1 ||
+    Buffer.byteLength(value.message) > 512 ||
+    !Object.hasOwn(messages, value.code)
+  )
+    fail("Invalid scheduler response.");
+  return { code: value.code, message: messages[value.code] };
+}
+
+function canonicalErrorField(record: unknown, field: string) {
+  if (!object(record)) fail("Invalid scheduler response.");
+  if (Object.hasOwn(record, field) && record[field] !== null)
+    record[field] = canonicalError(record[field]);
 }
 
 function reply(status: number, value: unknown, op: string): Reply {
@@ -281,17 +343,11 @@ function reply(status: number, value: unknown, op: string): Reply {
   if (
     value.ok === false &&
     keys(value, ["ok", "error"]) &&
-    object(value.error) &&
-    keys(value.error, ["code", "message"]) &&
-    typeof value.error.code === "string" &&
-    typeof value.error.message === "string" &&
-    Buffer.byteLength(value.error.message) >= 1 &&
-    Buffer.byteLength(value.error.message) <= 512 &&
-    Object.hasOwn(messages, value.error.code)
+    object(value.error)
   ) {
     return {
       ok: false,
-      error: { code: value.error.code, message: messages[value.error.code] },
+      error: canonicalError(value.error),
     };
   }
   if (
@@ -305,6 +361,28 @@ function reply(status: number, value: unknown, op: string): Reply {
     !object(value.result.data)
   )
     fail("Invalid scheduler response.");
+  // Only the protocol's typed error slots are normalized; user prompt text is literal.
+  const { kind, data } = value.result;
+  switch (kind) {
+    case "created":
+    case "page":
+    case "log": {
+      const items = kind === "created" ? data.schedules : data.items;
+      if (items !== undefined) {
+        if (!Array.isArray(items)) fail("Invalid scheduler response.");
+        for (const item of items)
+          canonicalErrorField(item, kind === "log" ? "error" : "last_error");
+      }
+      break;
+    }
+    case "schedule":
+      canonicalErrorField(data, "last_error");
+      break;
+    case "cancel":
+      if (data.schedule !== undefined)
+        canonicalErrorField(data.schedule, "last_error");
+      break;
+  }
   return value as Reply;
 }
 

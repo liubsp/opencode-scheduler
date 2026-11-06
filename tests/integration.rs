@@ -17,6 +17,122 @@ use tempfile::TempDir;
 // Keep chains sequential; the singleton test still launches concurrent CLI starts itself.
 static CLI_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[test]
+fn malformed_time_is_rejected_before_private_directory_or_startup() {
+    let home = TempDir::new().unwrap();
+    let root = home.path().join("not-a-directory");
+    std::fs::write(&root, "do not touch").unwrap();
+    for json in [false, true] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"));
+        cmd.env("OPENCODE_SCHEDULER_HOME", &root).args([
+            "schedule",
+            "create",
+            "--session",
+            "ses_fixture",
+            "--at",
+            "5:0",
+            "--prompt",
+            "fixture",
+        ]);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().unwrap();
+        assert!(!out.status.success());
+        let text = if json {
+            String::from_utf8(out.stdout).unwrap()
+        } else {
+            String::from_utf8(out.stderr).unwrap()
+        };
+        assert!(text.contains("2099-11-06T05:00:00+01:00"), "{text}");
+        assert!(!text.contains("storage_failure"), "{text}");
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), "do not touch");
+    }
+}
+
+#[test]
+fn help_teaches_every_visible_command_and_time_contract() {
+    for (args, phrases) in [
+        (vec![], vec!["Manage", "Inspect", "Install", "Examples:"]),
+        (
+            vec!["schedule"],
+            vec!["Create", "List", "Cancel", "delivery"],
+        ),
+        (
+            vec!["schedule", "create"],
+            vec![
+                "ALL",
+                "next strictly future",
+                "YYYY-MM-DD",
+                "RFC 3339",
+                "daemon host",
+                "offset",
+                "identical",
+                "admission",
+                "completion",
+                "Examples:",
+            ],
+        ),
+        (vec!["schedule", "list"], vec!["1-100", "cursor", "prompt"]),
+        (vec!["schedule", "show"], vec!["UUID", "prompt"]),
+        (
+            vec!["schedule", "cancel"],
+            vec!["UUID", "retract", "uncertain"],
+        ),
+        (
+            vec!["schedule", "log"],
+            vec!["UUID", "six", "10/20/40/80/160", "1-100"],
+        ),
+        (vec!["daemon"], vec!["Start", "Stop", "Inspect"]),
+        (vec!["daemon", "start"], vec!["pending", "startup"]),
+        (vec!["daemon", "stop"], vec!["preserv", "OpenCode"]),
+        (vec!["daemon", "status"], vec!["read-only", "start"]),
+        (vec!["status"], vec!["read-only", "start"]),
+        (vec!["install"], vec!["PATH", "preserv", "no-path"]),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+            .args(&args)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        for phrase in phrases {
+            assert!(text.contains(phrase), "{args:?} missing {phrase}: {text}");
+        }
+    }
+}
+
+#[test]
+fn parser_errors_offer_help_and_valid_delivery_choices() {
+    for (args, hint) in [
+        (vec!["schedule", "create"], "--help"),
+        (
+            vec![
+                "schedule",
+                "create",
+                "--session",
+                "ses_fixture",
+                "--at",
+                "5:00",
+                "--prompt",
+                "fixture",
+                "--delivery",
+                "invalid",
+            ],
+            "steer, queue",
+        ),
+        (vec!["schedule", "unknown"], "--help"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8(out.stderr).unwrap().contains(hint));
+    }
+}
+
 struct DaemonCleanup(std::path::PathBuf);
 impl Drop for DaemonCleanup {
     fn drop(&mut self) {
@@ -105,6 +221,50 @@ async fn human_output_is_readable_for_all_operations() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clock_creation_echoes_full_local_instant_in_isolated_fixture() {
+    let _fixture = CLI_FIXTURES.lock().await;
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let _cleanup = DaemonCleanup(home.path().join("private"));
+    let posts = Arc::new(Mutex::new(Vec::new()));
+    let server = fixture(&state, posts.clone()).await;
+    let clock = (chrono::Local::now() + chrono::Duration::hours(1))
+        .format("%H:%M:%S")
+        .to_string();
+    let request = uuid::Uuid::new_v4().to_string();
+    let args = [
+        "schedule",
+        "create",
+        "--session",
+        "ses_a",
+        "--at",
+        &clock,
+        "--prompt",
+        "fixture only",
+        "--request-id",
+        &request,
+    ];
+    let created = cli(&home, &state, &args);
+    let summary = &created["result"]["data"]["schedules"][0];
+    let time = &summary["time"];
+    assert_eq!(time["original"], clock);
+    assert!(time["timezone"].is_string());
+    let display = time["display"].as_str().unwrap();
+    assert!(display.len() > 25, "{display}");
+    let due: chrono::DateTime<chrono::Utc> = time["due_at"].as_str().unwrap().parse().unwrap();
+    assert!(due > chrono::Utc::now());
+    assert_eq!(cli(&home, &state, &args), created);
+    human(
+        &home,
+        &state,
+        &["schedule", "cancel", summary["id"].as_str().unwrap()],
+    );
+    assert!(posts.lock().unwrap().is_empty());
+    human(&home, &state, &["daemon", "stop"]);
+    server.abort();
+}
+
 #[test]
 fn json_automation_contract_unchanged() {
     use opencode_scheduler::types::OperationResult;
@@ -161,11 +321,195 @@ fn json_automation_contract_unchanged() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
-        json!({"ok":false,"error":{"code":"invalid_input","message":"Invalid scheduler input."}})
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 2);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"].as_object().unwrap().len(), 2);
+    assert_eq!(value["error"]["code"], "invalid_time");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Hint:")
     );
     assert!(!home.path().join("private").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn historical_errors_are_canonical_in_every_outward_envelope_without_rewriting_data() {
+    use opencode_scheduler::{runtime::Paths, store::Store, time::resolve_at, types::*};
+    let _fixture = CLI_FIXTURES.lock().await;
+    for old_message in [
+        "OpenCode service is unavailable.",
+        "synthetic SQL private/error/path",
+    ] {
+        let home = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let paths = Paths {
+            root: home.path().join("private"),
+        };
+        let _cleanup = DaemonCleanup(paths.root.clone());
+        paths.prepare().unwrap();
+        let input = CreateInput {
+            request_id: uuid::Uuid::new_v4().to_string(), target: TargetSelector::Id("ses_fixture".into()),
+            at: "2099-11-06T05:00:00+01:00".into(),
+            prompt: r#"literal {"last_error":{"code":"opencode_unavailable","message":"do not normalize literal"}}"#.into(),
+            delivery: DeliveryMode::Queue,
+        };
+        let mut store = Store::open(&paths.file("schedules.sqlite3")).unwrap();
+        let created = store
+            .create(
+                ValidatedCreate {
+                    input: input.clone(),
+                    time: resolve_at(&input.at, &chrono::Utc, None, chrono::Utc::now()).unwrap(),
+                    recipients: vec![ResolvedRecipient {
+                        target: Target {
+                            session_id: "ses_fixture".into(),
+                            title: None,
+                        },
+                        message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                    }],
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let id = created.schedules[0].id.clone();
+        drop(store);
+        // Seed a preserved pre-upgrade/adversarial record through raw fixture SQL, not product writes.
+        let conn = rusqlite::Connection::open(paths.file("schedules.sqlite3")).unwrap();
+        let mut schedule: Value = serde_json::from_str(
+            &conn
+                .query_row("SELECT data_json FROM schedules WHERE id=?1", [&id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let error = json!({"code":"opencode_unavailable","message":old_message});
+        schedule["last_error"] = error.clone();
+        conn.execute(
+            "UPDATE schedules SET data_json=?1 WHERE id=?2",
+            rusqlite::params![schedule.to_string(), id],
+        )
+        .unwrap();
+        let mut cached = serde_json::to_value(&created).unwrap();
+        cached["schedules"][0]["last_error"] = error.clone();
+        conn.execute(
+            "UPDATE create_requests SET result_json=?1",
+            [cached.to_string()],
+        )
+        .unwrap();
+        let event = json!({"seq":1,"schedule_id":id,"ordinal":1,"started_at":"2026-11-06T00:00:00Z","finished_at":"2026-11-06T00:00:01Z","phase":"discovery","outcome":"transient","certainty":"not_admitted","error":error,"next_attempt_at":null});
+        conn.execute(
+            "INSERT INTO delivery_log(schedule_id,data_json) VALUES (?1,?2)",
+            rusqlite::params![id, event.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        human(&home, &state, &["daemon", "start"]);
+        let endpoint: Value =
+            serde_json::from_slice(&std::fs::read(paths.file("endpoint.json")).unwrap()).unwrap();
+        for args in [
+            vec!["schedule", "list"],
+            vec!["schedule", "show", &id],
+            vec!["schedule", "log", &id],
+            vec![
+                "schedule",
+                "create",
+                "--session",
+                "ses_fixture",
+                "--at",
+                &input.at,
+                "--prompt",
+                &input.prompt,
+                "--request-id",
+                &input.request_id,
+                "--delivery",
+                "queue",
+            ],
+            vec!["schedule", "cancel", &id],
+        ] {
+            let value = cli(&home, &state, &args);
+            let data = &value["result"]["data"];
+            let (operation, pointer) = match args[1] {
+                "list" => (
+                    Operation::ScheduleList(PageInput::default()),
+                    "/result/data/items/0/last_error",
+                ),
+                "log" => (
+                    Operation::ScheduleLog(LogInput {
+                        id: id.clone(),
+                        limit: 50,
+                        cursor: None,
+                    }),
+                    "/result/data/items/0/error",
+                ),
+                "create" => (
+                    Operation::ScheduleCreate(input.clone()),
+                    "/result/data/schedules/0/last_error",
+                ),
+                "cancel" => (
+                    Operation::ScheduleCancel(IdInput { id: id.clone() }),
+                    "/result/data/schedule/last_error",
+                ),
+                _ => (
+                    Operation::ScheduleShow(IdInput { id: id.clone() }),
+                    "/result/data/last_error",
+                ),
+            };
+            let nested = value.pointer(pointer).unwrap();
+            assert_eq!(nested["code"], "opencode_unavailable");
+            assert!(
+                nested["message"].as_str().unwrap().contains("Hint:"),
+                "{args:?}: {nested}"
+            );
+            assert!(
+                !nested["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("private/error/path")
+            );
+            // Inspect the daemon's wire response independently of the CLI's defensive normalization.
+            let direct: Value = reqwest::Client::new()
+                .post(format!("{}/v1/rpc", endpoint["base_url"].as_str().unwrap()))
+                .bearer_auth(endpoint["token"].as_str().unwrap())
+                .header(
+                    "X-Scheduler-Instance",
+                    endpoint["instance_id"].as_str().unwrap(),
+                )
+                .json(&operation)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(direct.pointer(pointer).unwrap(), nested);
+            let human = opencode_scheduler::output::render(&value).unwrap();
+            assert!(human.contains("Hint:"));
+            assert!(!human.contains("private/error/path"));
+            if args[1] == "show" {
+                assert_eq!(data["prompt"], input.prompt);
+            }
+            if args[1] == "cancel" {
+                assert_eq!(data["schedule"]["prompt"], input.prompt);
+            }
+        }
+        let conn = rusqlite::Connection::open(paths.file("schedules.sqlite3")).unwrap();
+        for sql in [
+            "SELECT data_json FROM schedules",
+            "SELECT data_json FROM delivery_log WHERE seq=1",
+            "SELECT result_json FROM create_requests",
+        ] {
+            let raw: String = conn.query_row(sql, [], |r| r.get(0)).unwrap();
+            assert!(
+                raw.contains(old_message),
+                "reading/returning results must not rewrite persisted wording"
+            );
+        }
+        drop(conn);
+        human(&home, &state, &["daemon", "stop"]);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

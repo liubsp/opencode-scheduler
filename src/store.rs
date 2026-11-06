@@ -14,7 +14,19 @@ pub struct Store {
 }
 
 fn db<T>(result: rusqlite::Result<T>) -> Result<T, ApiError> {
-    result.map_err(|_| ApiError::storage())
+    result.map_err(|error| {
+        let code = match error.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DiskFull) => "storage_full",
+            Some(rusqlite::ErrorCode::PermissionDenied | rusqlite::ErrorCode::ReadOnly) => {
+                "storage_permission"
+            }
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                "storage_busy"
+            }
+            _ => "storage_failure",
+        };
+        ApiError::coded(code)
+    })
 }
 fn json<T: Serialize>(value: &T) -> Result<String, ApiError> {
     serde_json::to_string(value).map_err(|_| ApiError::storage())
@@ -571,8 +583,10 @@ fn lookup(conn: &Connection, input: &CreateInput) -> Result<Option<CreateResult>
 }
 fn validate_create(create: &ValidatedCreate, now: DateTime<Utc>) -> Result<(), ApiError> {
     create.input.validate()?;
+    if create.time.due_at <= now {
+        return Err(ApiError::coded("time_in_past"));
+    }
     if create.recipients.is_empty()
-        || create.time.due_at <= now
         || create.time.original != create.input.at
         || create.time.display.is_empty()
     {
@@ -742,6 +756,20 @@ fn make_page<T>(mut values: Vec<(i64, T)>, limit: u16, scope: &str) -> Result<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_disk_full_and_readonly_errors_are_safe_and_actionable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE data (x); PRAGMA max_page_count=2;")
+            .unwrap();
+        let error = db(conn.execute("INSERT INTO data VALUES (zeroblob(100000))", [])).unwrap_err();
+        assert_eq!(error.code, "storage_full");
+        assert!(error.message.contains("space"));
+        conn.execute_batch("PRAGMA query_only=ON;").unwrap();
+        let error = db(conn.execute("INSERT INTO data VALUES ('private')", [])).unwrap_err();
+        assert_eq!(error.code, "storage_permission");
+        assert!(!error.message.contains("INSERT"));
+    }
     use crate::time::resolve_at;
     use chrono::{DateTime, Duration, Utc};
     use std::collections::HashSet;
@@ -786,6 +814,68 @@ mod tests {
             recipients,
             time,
         }
+    }
+
+    #[tokio::test]
+    async fn clock_replay_returns_original_batch_before_api_time_or_network_resolution() {
+        let (dir, mut store) = fixture();
+        let mut batch = create(&["ses_fixture"]);
+        batch.input.at = "5:00".into();
+        batch.time = resolve_at(
+            "5:00",
+            &chrono_tz::Europe::Stockholm,
+            Some("Europe/Stockholm"),
+            now(),
+        )
+        .unwrap();
+        let result = store.create(batch.clone(), now()).unwrap();
+        assert_eq!(
+            result.schedules[0].time.due_at.to_rfc3339(),
+            "2026-11-05T04:00:00+00:00"
+        );
+        // Even stale validation after a day change must not replace the original due time.
+        assert_eq!(
+            store
+                .create(batch.clone(), now() + Duration::days(1))
+                .unwrap(),
+            result
+        );
+        let service = crate::api::Service {
+            store: std::sync::Mutex::new(store),
+            adapter: crate::adapter::Adapter::new().unwrap(),
+            paths: crate::runtime::Paths {
+                root: dir.path().to_path_buf(),
+            },
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            stop: tokio::sync::Notify::new(),
+        };
+        let OperationResult::Created(replayed) = service
+            .execute(Operation::ScheduleCreate(batch.input))
+            .await
+            .unwrap()
+        else {
+            panic!("expected replay");
+        };
+        assert_eq!(replayed, result);
+    }
+
+    #[test]
+    fn clock_that_passes_during_validation_is_not_rolled_forward_at_commit() {
+        let (_dir, mut store) = fixture();
+        let mut batch = create(&["ses_fixture"]);
+        batch.input.at = "5:00".into();
+        batch.time = resolve_at(
+            "5:00",
+            &chrono_tz::Europe::Stockholm,
+            Some("Europe/Stockholm"),
+            now(),
+        )
+        .unwrap();
+        let input = batch.input.clone();
+        let commit_at = batch.time.due_at;
+        let error = store.create(batch, commit_at).unwrap_err();
+        assert_eq!(error.code, "time_in_past");
+        assert!(store.lookup_create(&input).unwrap().is_none());
     }
     fn add(store: &mut Store) -> Schedule {
         let result = store.create(create(&["ses_test"]), now()).unwrap();

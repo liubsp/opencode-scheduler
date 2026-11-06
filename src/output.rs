@@ -25,13 +25,15 @@ fn schedule(s: &Value) -> String {
         next_attempt(&s["next_attempt_at"])
     );
     if !s["last_error"].is_null() {
-        out.push_str(&format!(
-            "  Error: {}: {}\n",
-            text(&s["last_error"]["code"]),
-            text(&s["last_error"]["message"])
-        ));
+        out.push_str(&format!("  Error: {}\n", safe_error(&s["last_error"])));
     }
     out
+}
+fn safe_error(value: &Value) -> ApiError {
+    serde_json::from_value::<ApiError>(value.clone())
+        .ok()
+        .and_then(|error| error.sanitized().ok())
+        .unwrap_or_else(ApiError::storage)
 }
 fn next_attempt(value: &Value) -> String {
     if value.is_null() {
@@ -96,11 +98,7 @@ pub fn render(value: &Value) -> Result<String, ApiError> {
                     next_attempt(&e["next_attempt_at"])
                 ));
                 if !e["error"].is_null() {
-                    out.push_str(&format!(
-                        "  Error: {}: {}\n",
-                        text(&e["error"]["code"]),
-                        text(&e["error"]["message"])
-                    ));
+                    out.push_str(&format!("  Error: {}\n", safe_error(&e["error"])));
                 }
             }
             cursor(data, &mut out);
@@ -148,6 +146,7 @@ mod tests {
             "opencode_unavailable",
             "OpenCode service is unavailable.",
             "next attempt: none",
+            "Hint:",
         ] {
             assert!(text.contains(expected), "{text}");
         }
@@ -165,6 +164,7 @@ mod tests {
             "2026-11-07T01:30:31Z",
             "opencode_unavailable",
             "--cursor fixture-cursor",
+            "Hint:",
         ] {
             assert!(text.contains(expected), "{text}");
         }

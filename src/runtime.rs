@@ -1,5 +1,5 @@
 use crate::{
-    adapter::{bounded_json, local_url, unavailable},
+    adapter::{bounded_json, local_url},
     types::*,
 };
 use fs2::FileExt;
@@ -53,13 +53,12 @@ impl Paths {
         })
     }
     pub fn prepare(&self) -> Result<(), ApiError> {
-        if self.root.exists()
-            && fs::symlink_metadata(&self.root)
-                .map_err(|_| ApiError::storage())?
-                .file_type()
-                .is_symlink()
-        {
-            return Err(ApiError::storage());
+        let failure = || ApiError::coded("private_directory_failure");
+        if self.root.exists() {
+            let meta = fs::symlink_metadata(&self.root).map_err(|_| failure())?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err(failure());
+            }
         }
         #[cfg(windows)]
         {
@@ -76,21 +75,10 @@ impl Paths {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .map_err(|_| ApiError::storage())?;
-            let started = std::time::Instant::now();
-            let status = loop {
-                if let Some(status) = child.try_wait().map_err(|_| ApiError::storage())? {
-                    break status;
-                }
-                if started.elapsed() >= Duration::from_secs(5) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(ApiError::storage());
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            };
+                .map_err(|_| failure())?;
+            let status = wait_private_helper(&mut child, PRIVATE_HELPER_TIMEOUT)?;
             if !status.success() {
-                return Err(ApiError::storage());
+                return Err(failure());
             }
         }
         #[cfg(unix)]
@@ -99,22 +87,50 @@ impl Paths {
             if !self.root.exists() {
                 let mut builder = fs::DirBuilder::new();
                 builder.recursive(true).mode(0o700);
-                builder
-                    .create(&self.root)
-                    .map_err(|_| ApiError::storage())?;
+                builder.create(&self.root).map_err(|_| failure())?;
             }
-            let meta = fs::metadata(&self.root).map_err(|_| ApiError::storage())?;
+            let meta = fs::metadata(&self.root).map_err(|_| failure())?;
             // Compare ownership against the current process's own newly-created file.
             let probe = self.file(&format!(".owner-{}", Uuid::new_v4()));
-            let file = private_file(&probe)?;
-            let uid = file.metadata().map_err(|_| ApiError::storage())?.uid();
+            let file = private_file(&probe).map_err(|_| failure())?;
+            let uid = file.metadata().map_err(|_| failure())?.uid();
             drop(file);
-            fs::remove_file(probe).map_err(|_| ApiError::storage())?;
+            fs::remove_file(probe).map_err(|_| failure())?;
             if meta.uid() != uid || meta.mode() & 0o077 != 0 {
-                return Err(ApiError::storage());
+                return Err(failure());
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+// Cold PowerShell startup can exceed five seconds under concurrent process-heavy work.
+// Keep security validation mandatory, bounded and separately observable from daemon startup.
+const PRIVATE_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(windows)]
+fn wait_private_helper(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, ApiError> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ApiError::coded(if result.is_err() {
+                    "private_directory_failure"
+                } else {
+                    "private_directory_timeout"
+                }));
+            }
+        }
     }
 }
 pub fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, ApiError> {
@@ -171,7 +187,7 @@ impl Endpoint {
             ));
         }
         validate_uuid(&self.instance_id)?;
-        local_url(&self.base_url, true)?;
+        local_url(&self.base_url, true).map_err(scheduler_error)?;
         if !(64..=128).contains(&self.token.len())
             || !self.token.bytes().all(|b| b.is_ascii_hexdigit())
             || self.pid == 0
@@ -189,7 +205,16 @@ fn client() -> Result<reqwest::Client, ApiError> {
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(35))
         .build()
-        .map_err(|_| unavailable())
+        .map_err(|_| ApiError::coded("daemon_unavailable"))
+}
+// The shared bounded HTTP reader uses OpenCode error categories. At the scheduler
+// boundary, retain limits but identify the correct service without exposing bodies.
+fn scheduler_error(error: ApiError) -> ApiError {
+    match error.code.as_str() {
+        "opencode_unavailable" => ApiError::coded("daemon_unavailable"),
+        "unsupported_service" => ApiError::coded("unsupported_protocol"),
+        _ => error,
+    }
 }
 pub async fn discover_daemon(paths: &Paths) -> Result<Option<Endpoint>, ApiError> {
     let path = paths.file("endpoint.json");
@@ -216,7 +241,9 @@ pub async fn discover_daemon(paths: &Paths) -> Result<Option<Endpoint>, ApiError
             "Service authentication failed.",
         ));
     }
-    let value = bounded_json(response, 64 * 1024).await?;
+    let value = bounded_json(response, 64 * 1024)
+        .await
+        .map_err(scheduler_error)?;
     if value["protocol"] != 1
         || value["instance_id"] != endpoint.instance_id
         || !value["binary_version"].is_string()
@@ -229,10 +256,10 @@ pub async fn discover_daemon(paths: &Paths) -> Result<Option<Endpoint>, ApiError
     Ok(Some(endpoint))
 }
 pub async fn ensure_daemon(paths: &Paths) -> Result<Endpoint, ApiError> {
-    let started = std::time::Instant::now();
     paths.prepare()?;
     tokio::time::timeout(
-        Duration::from_secs(15).saturating_sub(started.elapsed()),
+        // The daemon repeats private-directory validation before opening its database.
+        Duration::from_secs(30),
         async {
             let startup = private_file(&paths.file("startup.lock"))?;
             loop {
@@ -245,7 +272,9 @@ pub async fn ensure_daemon(paths: &Paths) -> Result<Endpoint, ApiError> {
                 return Ok(endpoint);
             }
             let lifetime = private_file(&paths.file("daemon.lock"))?;
-            lifetime.try_lock_exclusive().map_err(|_| unavailable())?;
+            lifetime
+                .try_lock_exclusive()
+                .map_err(|_| ApiError::coded("daemon_startup_failure"))?;
             drop(lifetime);
             let log = paths.file("diagnostic.log");
             if fs::metadata(&log).is_ok_and(|m| m.len() >= 1024 * 1024) {
@@ -261,7 +290,8 @@ pub async fn ensure_daemon(paths: &Paths) -> Result<Endpoint, ApiError> {
                 std::env::current_exe().map_err(|_| ApiError::storage())?
             };
             #[cfg(windows)]
-            let mut child = crate::launch::spawn(&exe, &paths.root)?;
+            let mut child = crate::launch::spawn(&exe, &paths.root)
+                .map_err(|_| ApiError::coded("daemon_startup_failure"))?;
             #[cfg(not(windows))]
             let mut child = {
                 let out = private_file(&log)?;
@@ -279,21 +309,27 @@ pub async fn ensure_daemon(paths: &Paths) -> Result<Endpoint, ApiError> {
                     use std::os::unix::process::CommandExt;
                     command.process_group(0);
                 }
-                command.spawn().map_err(|_| unavailable())?
+                command
+                    .spawn()
+                    .map_err(|_| ApiError::coded("daemon_startup_failure"))?
             };
             loop {
                 if let Some(endpoint) = discover_daemon(paths).await? {
                     return Ok(endpoint);
                 }
-                if child.try_wait().map_err(|_| unavailable())?.is_some() {
-                    return Err(unavailable());
+                if child
+                    .try_wait()
+                    .map_err(|_| ApiError::coded("daemon_startup_failure"))?
+                    .is_some()
+                {
+                    return Err(ApiError::coded("daemon_startup_failure"));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         },
     )
     .await
-    .map_err(|_| unavailable())?
+    .map_err(|_| ApiError::coded("daemon_startup_timeout"))?
 }
 pub async fn rpc(endpoint: &Endpoint, operation: &Operation) -> Result<Value, ApiError> {
     endpoint.validate()?;
@@ -304,9 +340,194 @@ pub async fn rpc(endpoint: &Endpoint, operation: &Operation) -> Result<Value, Ap
         .json(operation)
         .send()
         .await
-        .map_err(|_| unavailable())?;
-    bounded_json(response, 16 * 1024 * 1024).await
+        .map_err(|_| ApiError::coded("daemon_unavailable"))?;
+    let mut value = bounded_json(response, 16 * 1024 * 1024)
+        .await
+        .map_err(scheduler_error)?;
+    // Also protect callers talking to an older daemon with historical error wording.
+    if value["ok"] == true {
+        let mut result: OperationResult = serde_json::from_value(value["result"].clone())
+            .map_err(|_| ApiError::coded("unsupported_protocol"))?;
+        result.canonicalize_errors();
+        value["result"] = json!(result);
+    }
+    Ok(value)
 }
 pub fn absent_status(paths: &Paths) -> Value {
     json!({"installed":{"binary":paths.binary().exists(),"plugin":false},"daemon":{"reachable":false,"protocol_compatible":false},"opencode":{"state":"unknown","service_version":null},"schedules":{"pending":null,"blocked":null,"failed":null,"admission_unconfirmed":null}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rpc_from_an_older_daemon_canonicalizes_nested_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Endpoint {
+            protocol: 1,
+            instance_id: Uuid::new_v4().to_string(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            pid: 1,
+            token: "ab".repeat(48),
+        };
+        let body = json!({"ok":true,"result":{"kind":"log","data":{"items":[{"seq":1,"schedule_id":"fixture","ordinal":1,"started_at":"2026-11-06T00:00:00Z","finished_at":null,"phase":"discovery","outcome":"transient","certainty":"not_admitted","error":{"code":"opencode_unavailable","message":"synthetic SQL private/error/path"},"next_attempt_at":null}],"next_cursor":null}}}).to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let result = rpc(
+            &endpoint,
+            &Operation::ScheduleLog(LogInput {
+                id: Uuid::new_v4().to_string(),
+                limit: 50,
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let message = result["result"]["data"]["items"][0]["error"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.contains("Hint:"));
+        assert!(!message.contains("private/error/path"));
+    }
+
+    #[tokio::test]
+    async fn daemon_connection_failure_preserves_uncertain_create_recovery() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let endpoint = Endpoint {
+            protocol: 1,
+            instance_id: Uuid::new_v4().to_string(),
+            base_url,
+            pid: 1,
+            token: "ab".repeat(48),
+        };
+        let error = rpc(&endpoint, &Operation::Status(EmptyInput {}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "daemon_unavailable");
+        assert!(
+            error
+                .message
+                .contains("same request ID and identical input")
+        );
+        assert!(!error.message.contains(&endpoint.token));
+    }
+
+    #[tokio::test]
+    async fn malformed_scheduler_responses_are_not_mislabeled_as_opencode_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (response, code) in [
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbad",
+                "unsupported_protocol",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
+                "daemon_unavailable",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = Endpoint {
+                protocol: 1,
+                instance_id: Uuid::new_v4().to_string(),
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                pid: 1,
+                token: "ab".repeat(48),
+            };
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                assert!(socket.read(&mut bytes).await.unwrap() > 0);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let error = rpc(&endpoint, &Operation::Status(EmptyInput {}))
+                .await
+                .unwrap_err()
+                .sanitized()
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(error.code, code);
+            assert!(error.message.contains("Hint:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_daemon_executable_reports_startup_stage_without_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            root: dir.path().join("private"),
+        };
+        paths.prepare().unwrap();
+        fs::create_dir_all(paths.command_dir()).unwrap();
+        fs::write(paths.binary(), "not an executable").unwrap();
+        let error = ensure_daemon(&paths)
+            .await
+            .unwrap_err()
+            .sanitized()
+            .unwrap();
+        assert_eq!(error.code, "daemon_startup_failure");
+        assert!(error.message.contains("diagnostic.log"));
+        assert!(
+            !error
+                .message
+                .contains(&dir.path().to_string_lossy().to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_helper_allows_slow_startup_and_reaps_on_deadline() {
+        use std::os::windows::process::CommandExt;
+        let launch = |script: &str| {
+            Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .creation_flags(0x08000000)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut slow = launch("Start-Sleep -Milliseconds 5200");
+        assert!(
+            wait_private_helper(&mut slow, PRIVATE_HELPER_TIMEOUT)
+                .unwrap()
+                .success()
+        );
+        let mut stuck = launch("Start-Sleep -Seconds 60");
+        let error = wait_private_helper(&mut stuck, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.code, "private_directory_timeout");
+        assert!(stuck.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn private_directory_failure_identifies_security_preparation_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("file");
+        fs::write(&root, "keep").unwrap();
+        let error = Paths { root: root.clone() }
+            .prepare()
+            .unwrap_err()
+            .sanitized()
+            .unwrap();
+        assert_eq!(error.code, "private_directory_failure");
+        assert!(error.message.contains("permissions"));
+        assert_eq!(fs::read_to_string(root).unwrap(), "keep");
+    }
 }

@@ -37,7 +37,7 @@ impl Service {
         match request {
             Operation::ScheduleCreate(input) => {
                 if self.stopping.load(Ordering::SeqCst) {
-                    return Err(crate::adapter::unavailable());
+                    return Err(ApiError::coded("daemon_unavailable"));
                 }
                 input.validate()?;
                 if let Some(result) = self.store()?.lookup_create(&input)? {
@@ -47,14 +47,17 @@ impl Service {
                 let time = if chrono::DateTime::parse_from_rfc3339(&input.at).is_ok() {
                     resolve_at(&input.at, &Utc, None, now)?
                 } else {
-                    let name = iana_time_zone::get_timezone().map_err(|_| ApiError::invalid())?;
-                    let zone: chrono_tz::Tz = name.parse().map_err(|_| ApiError::invalid())?;
+                    let name = iana_time_zone::get_timezone()
+                        .map_err(|_| ApiError::coded("timezone_unavailable"))?;
+                    let zone: chrono_tz::Tz = name
+                        .parse()
+                        .map_err(|_| ApiError::coded("timezone_unavailable"))?;
                     resolve_at(&input.at, &zone, Some(&name), now)?
                 };
                 let mut adapter = self.adapter.clone();
                 let targets = adapter.resolve_targets(&input.target).await?;
                 if self.stopping.load(Ordering::SeqCst) {
-                    return Err(crate::adapter::unavailable());
+                    return Err(ApiError::coded("daemon_unavailable"));
                 }
                 let recipients = targets
                     .into_iter()

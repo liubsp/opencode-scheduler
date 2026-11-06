@@ -203,20 +203,117 @@ test("domain errors keep code and safe canonical wording, never credentials", as
   t.after(() => f.close());
   const client = new SchedulerClient(f.configPath);
   t.after(() => client.dispose());
-  for (const [code, message] of [
-    ["already_admitted", "Prompt is already admitted."],
-    ["outcome_uncertain", "Prompt admission is unconfirmed."],
-    ["request_conflict", "Request ID has different original input."],
+  for (const [code, hint] of [
+    ["already_admitted", "retract"],
+    ["outcome_uncertain", "schedule log"],
+    ["request_conflict", "identical"],
+    ["invalid_time", "2099-11-06T05:00:00+01:00"],
+    ["time_in_past", "future"],
+    ["local_time_invalid", "offset"],
+    ["timezone_unavailable", "offset"],
+    ["private_directory_failure", "permissions"],
+    ["private_directory_timeout", "deadline"],
+    ["daemon_startup_failure", "diagnostic.log"],
+    ["daemon_startup_timeout", "status"],
+    ["daemon_unavailable", "same request"],
+    ["storage_permission", "permissions"],
+    ["storage_full", "space"],
+    ["storage_busy", "writer"],
   ]) {
     f.setRpc(async (_body, res) => {
       res
         .writeHead(409)
         .end(JSON.stringify({ ok: false, error: { code, message: f.token } }));
     });
-    assert.deepEqual(await client.call("schedule_cancel", { id: requestID }), {
-      ok: false,
-      error: { code, message },
-    });
+    const result = await client.call("schedule_cancel", { id: requestID });
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("expected a domain error");
+    assert.equal(result.error.code, code);
+    assert.ok(result.error.message.includes(hint));
+    assert.ok(result.error.message.includes("Hint:"));
+    assert.ok(!result.error.message.includes(f.token));
+  }
+});
+
+test("nested historical and adversarial error fields are canonical without touching literal prompts", async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  const client = new SchedulerClient(f.configPath);
+  t.after(() => client.dispose());
+  const prompt =
+    'literal {"last_error":{"code":"opencode_unavailable","message":"do not normalize literal"}}';
+  for (const message of [
+    "OpenCode service is unavailable.",
+    "synthetic SQL private/error/path",
+  ]) {
+    const summary = {
+      ...created().result.data.schedules[0],
+      last_error: { code: "opencode_unavailable", message },
+    };
+    const schedule = { ...summary, prompt };
+    for (const [op, kind, data, errorPath] of [
+      [
+        "schedule_create",
+        "created",
+        { request_id: requestID, schedules: [summary] },
+        ["schedules", 0, "last_error"],
+      ],
+      [
+        "schedule_list",
+        "page",
+        { items: [summary], next_cursor: null },
+        ["items", 0, "last_error"],
+      ],
+      ["schedule_show", "schedule", schedule, ["last_error"]],
+      [
+        "schedule_cancel",
+        "cancel",
+        { schedule, disposition: "cancelled" },
+        ["schedule", "last_error"],
+      ],
+      [
+        "schedule_log",
+        "log",
+        {
+          items: [
+            {
+              seq: 1,
+              schedule_id: summary.id,
+              ordinal: 1,
+              started_at: "2026-11-06T00:00:00Z",
+              finished_at: null,
+              phase: "discovery",
+              outcome: "transient",
+              certainty: "not_admitted",
+              error: summary.last_error,
+              next_attempt_at: null,
+            },
+          ],
+          next_cursor: null,
+        },
+        ["items", 0, "error"],
+      ],
+    ] as const) {
+      f.setRpc(async (_body, res) => {
+        res.end(JSON.stringify({ ok: true, result: { kind, data } }));
+      });
+      const result = await client.call(
+        op,
+        op === "schedule_create" ? input : { id: summary.id },
+      );
+      assert.equal(result.ok, true);
+      if (!result.ok) throw Error("expected success");
+      const error = errorPath.reduce<any>(
+        (value, key) => value[key],
+        result.result.data,
+      );
+      assert.equal(error.code, "opencode_unavailable");
+      assert.match(error.message, /Hint:/);
+      assert.ok(!error.message.includes("private/error/path"));
+      if (kind === "schedule") assert.equal(result.result.data.prompt, prompt);
+      if (kind === "cancel")
+        assert.equal(result.result.data.schedule.prompt, prompt);
+    }
   }
 });
 

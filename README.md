@@ -34,7 +34,7 @@ opencode-scheduler schedule create --session-title 'Exact session title' --at $a
 
 Use either `--session` or `--session-title`, not both. Title matching is exact and service-wide: **every match gets a separate schedule**. The complete recipient set is validated and committed together. Later title changes do not change that set.
 
-`--at` accepts an RFC 3339 datetime with an explicit offset, or local `YYYY-MM-DD HH:MM[:SS]`. Local input uses the host's IANA timezone and rejects ambiguous or nonexistent DST times. Creation prints the full resolved datetime. It must still be in the future when committed.
+`--at` accepts `5:00`, `05:00` or `05:00:30` for the **next strictly future local occurrence** (today if still future, otherwise tomorrow), an RFC 3339 datetime with an explicit offset, or local `YYYY-MM-DD HH:MM[:SS]`. For example, `'2099-11-06 05:00'` uses the daemon host's IANA timezone; `2099-11-06T05:00:00+01:00` specifies an explicit offset. Local input rejects ambiguous or nonexistent DST times: choose another time or specify an offset. Creation prints the full resolved date, offset and local timezone. The appointment must still be future when committed; slow validation never silently moves it to another day. Clock replay returns the original frozen appointment, even on another day.
 
 Create prints a request UUID to stderr before contacting the daemon. To recover a lost response, repeat the identical command with `--request-id <that UUID>`. This returns the original frozen batch, even if OpenCode is now offline; different input with the same UUID conflicts.
 
@@ -47,6 +47,16 @@ opencode-scheduler daemon stop
 ```
 
 Commands print readable summaries by default, including resolved dates, states, attempts and delivery errors. `list` and `log` accept `--limit` (1–100) and the `--cursor` printed with the previous page. For automation, optional `--json` returns the stable API success/error envelope on stdout. Errors exit nonzero; human diagnostics go to stderr.
+
+Every command has `--help`, including argument meanings, accepted time formats, delivery and recovery semantics. `steer` asks OpenCode to admit the prompt immediately; `queue` asks it to queue the prompt. Neither mode means the agent has completed the task.
+
+## Recover from an error
+
+Errors include a safe recovery hint. Malformed time syntax is rejected before directory preparation or service startup; the daemon remains authoritative for timezone resolution and replay. Private-directory security validation, its deadline, daemon startup, storage permissions, full disks and database lock contention have distinct error codes. Unknown storage failures stay explicitly unknown, rather than guessing a cause.
+
+First run `opencode-scheduler status`. If the scheduler is absent, use `opencode-scheduler daemon start`; inspect `diagnostic.log` in the private data directory locally if startup fails. Check ownership/write permissions and free disk space without weakening ACLs or deleting the database. On Windows, PowerShell security validation has a 15-second deadline; daemon startup then has a separate 30-second budget, including its own security validation. The plugin allows 85 seconds for the invoked start command: these stages, its final status RPC (up to 35 seconds), and process launch/exit overhead. A deadline does not prove startup failed: check status before acting. Sanitize diagnostics before sharing them.
+
+For a lost creation response, preserve the printed request UUID and repeat **identical input** with `--request-id <UUID>`; never change the timestamp or use a new UUID as a blind retry. Use `schedule list`, `schedule show <id>` and `schedule log <id>` to inspect existing work. Only create a new request after confirming you want a separate appointment. Admission uncertainty is not rejection, and cancellation cannot retract accepted work. There is no manual retry/reset command; automatic retries retain their original message ID and attempt budget.
 
 ## Delivery and limits
 
