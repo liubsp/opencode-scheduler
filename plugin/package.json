@@ -1,0 +1,33 @@
+{
+  "name": "opencode-scheduler-plugin",
+  "version": "0.1.0",
+  "description": "Thin OpenCode V2 tools for the native one-shot scheduler",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist/*.js",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "format": "prettier --write src test *.json",
+    "check": "prettier --check src test *.json && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "npm run build && tsx --test test/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "3.6.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

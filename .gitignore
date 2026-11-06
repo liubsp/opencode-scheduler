@@ -4,5 +4,8 @@
 /node_modules/
 /dist/
 /bin/
+/plugin/dist/
+/plugin/node_modules/
+/plugin/install.json
 *.tgz
 *.log
