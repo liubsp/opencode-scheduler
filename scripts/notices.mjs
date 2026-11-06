@@ -111,17 +111,32 @@ export async function rustNotices(root) {
         join(dirname(pkg.manifest_path), "sqlite3/sqlite3.c"),
         "utf8",
       );
-      const end = sqlite.indexOf("*/");
-      if (end < 0 || !sqlite.slice(0, end).includes("public domain"))
+      const attribution = [
+        ...sqlite.slice(0, 8192).matchAll(/\/\*[\s\S]*?\*\//g),
+      ].find((match) =>
+        match[0].includes("The author disclaims copyright"),
+      )?.[0];
+      if (!attribution)
         throw new Error("Missing bundled SQLite public-domain notice");
-      text += `\nBundled SQLite (public domain)\n${sqlite.slice(0, end + 2)}\n`;
+      text += `\nBundled SQLite (public domain)\n${attribution}\n`;
     }
   }
   const sysroot = run("rustc", ["--print", "sysroot"]).trim();
   const doc = join(sysroot, "share/doc/rust");
-  // Rust ships a generated attribution inventory for the linked standard library.
-  text += `\n===== Rust standard library =====\n${await readFile(join(doc, "COPYRIGHT-library.html"), "utf8")}\n`;
-  for (const name of (await readdir(join(doc, "licenses"))).sort()) {
+  // Preserve Rust's published attribution rather than inventing a std inventory.
+  // It covers all std targets, including dependencies not linked by this MSVC build.
+  text += `\n===== Rust standard library =====\nRust supplies the following cross-target attribution appendix as COPYRIGHT-library.html. Entries for other targets are upstream notices, not additional runtime dependencies of this Windows MSVC payload. The standard library is used under its MIT/Apache terms.\n${await readFile(join(doc, "COPYRIGHT-library.html"), "utf8")}\n`;
+  // These permissive texts cover std and its MSVC runtime exceptions; compiler,
+  // documentation fonts and GNU runtime license files are not shipped here.
+  for (const name of [
+    "Apache-2.0.txt",
+    "MIT.txt",
+    "Unicode-3.0.txt",
+    "BSD-2-Clause.txt",
+    "ISC.txt",
+    "LLVM-exception.txt",
+    "NCSA.txt",
+  ]) {
     text += `\nRust ${name}\n${await readFile(join(doc, "licenses", name), "utf8")}\n`;
   }
   return text;

@@ -66,8 +66,23 @@ For a lost creation response, preserve the printed request UUID and repeat **ide
 - Local list/show/cancel/log remain available while OpenCode is disconnected or a delivery is waiting on the network. `status` is read-only and never starts either service.
 - The daemon is singleton per data directory, bound to IPv4 loopback and protected by a private random token and instance ID. Windows launch uses no console and inherits no caller handles. `daemon stop` leaves schedules intact. There is no login/startup registration: start it manually after signing in.
 
-This is a development installation, not yet a distributable release. The TypeScript plugin and release packaging/CI are separate completion work. Global registration is currently Windows-only; non-Windows installation is not runtime-certified. OpenCode bootstrap uses one supported `opencode api get /api/info` helper, bounded to 15 seconds; delivery still uses authenticated HTTP, not CLI prompt forwarding. Inconclusive process ownership fails visibly rather than replacing a service. Keep the machine awake for on-time delivery; the scheduler does not wake it.
+Global registration is currently Windows-only; non-Windows installation is not runtime-certified. OpenCode bootstrap uses one supported `opencode api get /api/info` helper, bounded to 15 seconds; delivery still uses authenticated HTTP, not CLI prompt forwarding. Inconclusive process ownership fails visibly rather than replacing a service. Keep the machine awake for on-time delivery; the scheduler does not wake it.
 
 The earlier Windows pilot was validated with OpenCode service 2.2.5: timed prompt admission, same-message-ID retransmission, cancellation, scheduler stop/start recovery, message lookup, and delivery logs. Automated fixtures additionally cover human output, isolated staged upgrades, PATH transformations and bounded bootstrap. The completed global installation and live bootstrap still require installed validation. Other service versions and live OpenCode restart recovery have not been runtime-certified. No provider or quota-management policy is implemented.
+
+## Build an audited payload
+
+Requires a Windows x64 Rust MSVC toolchain with `rust-docs`, Node 22 or newer, npm and tar. The builder uses locked dependencies, remaps native compiler paths, bundles the plugin as ESM with only Node builtins external, and generates license notices from incorporated code. The SDK and bundler are development-only dependencies; the plugin package has no runtime npm dependencies.
+
+```powershell
+powershell -NoProfile -File scripts/build-release.ps1 -PayloadOnly
+node scripts/check-package.mjs dist/payload
+```
+
+`dist/payload` contains the native executable, bundled plugin, explicit-only CLI reference skill, README, license and generated third-party notices. The scanner enforces a strict file allowlist and checks text/native strings for private build prefixes, credentials and debug metadata. No runtime state or installation configuration is shipped.
+
+This staging payload is not a complete user installer release. Normal builder mode requires `scripts/install.ps1`, adds it to the payload, creates `dist/opencode-scheduler-<version>-windows-x64.zip`, then extracts and scans the archive. It fails clearly if the installer is absent. CI checks Rust and Node on Windows/Linux with Node 22/24; the release workflow builds an audited archive without publishing it.
+
+`skills/opencode-scheduler/SKILL.md` is a concise CLI reference for explicit user requests only. Its V2 `opencode/autoinvoke: false` metadata hides it from automatic advertisement while permitting explicit loading by ID. Skill installation and live registration require the product installer; merely building the payload does not change OpenCode configuration.
 
 MIT licensed.

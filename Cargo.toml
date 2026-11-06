@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Durable one-shot prompt scheduling for OpenCode V2"
+include = ["/src/**/*.rs", "/tests/**/*.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/.cargo/config.toml"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

@@ -1,0 +1,41 @@
+name: Check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-docs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: npm ci --prefix plugin
+      - run: npm run check --prefix plugin
+      - run: npm test --prefix plugin
+      - run: npm audit --omit=dev --prefix plugin
+      - name: Build and audit release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path scripts/install.ps1) {
+            ./scripts/build-release.ps1
+          } else {
+            ./scripts/build-release.ps1 -PayloadOnly
+          }
