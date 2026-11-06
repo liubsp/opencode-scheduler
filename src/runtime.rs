@@ -69,6 +69,9 @@ impl Paths {
             let script = r#"$ErrorActionPreference='Stop'; $p=$env:SCHEDULER_PRIVATE_ROOT; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; if(!(Test-Path -LiteralPath $p)){$a=New-Object Security.AccessControl.DirectorySecurity; $a.SetOwner($sid); $a.SetAccessRuleProtection($true,$false); $r=New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $a.AddAccessRule($r); $d=New-Object IO.DirectoryInfo($p); $d.Create($a)}; $i=Get-Item -LiteralPath $p; if($i.Attributes -band [IO.FileAttributes]::ReparsePoint){exit 2}; $a=Get-Acl -LiteralPath $p; if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){exit 3}; foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -ne $sid.Value){exit 4}}"#;
             let mut child = Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                // PowerShell 7 callers export incompatible module search paths to
+                // native children. Let Windows PowerShell resolve its own ACL module.
+                .env_remove("PSModulePath")
                 .env("SCHEDULER_PRIVATE_ROOT", &self.root)
                 .creation_flags(0x08000000)
                 .stdin(Stdio::null())
@@ -353,13 +356,105 @@ pub async fn rpc(endpoint: &Endpoint, operation: &Operation) -> Result<Value, Ap
     }
     Ok(value)
 }
+pub fn installed_plugin_path(paths: &Paths) -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Config {
+        protocol: u8,
+        binary: PathBuf,
+        data_home: PathBuf,
+    }
+    let read = |path: &Path| -> Option<Value> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return None;
+        }
+        serde_json::from_slice(&read_bounded(path, 64 * 1024).ok()?).ok()
+    };
+    let metadata = read(&paths.file("product-install.json"))?;
+    if metadata["protocol"] != 1 {
+        return None;
+    }
+    let plugin = PathBuf::from(metadata["plugin_path"].as_str()?);
+    if !plugin.is_absolute() || !paths.binary().is_file() {
+        return None;
+    }
+    let config: Config = serde_json::from_value(read(&plugin.join("install.json"))?).ok()?;
+    let package = read(&plugin.join("package.json"))?;
+    let entry = fs::symlink_metadata(plugin.join("dist/index.js")).ok()?;
+    (config.protocol == 1
+        && config.binary == paths.binary()
+        && config.data_home == paths.root
+        && package["name"] == "opencode-scheduler-plugin"
+        && package["type"] == "module"
+        && package["exports"]["."] == "./dist/index.js"
+        && entry.is_file()
+        && !entry.file_type().is_symlink())
+    .then_some(plugin)
+}
 pub fn absent_status(paths: &Paths) -> Value {
-    json!({"installed":{"binary":paths.binary().exists(),"plugin":false},"daemon":{"reachable":false,"protocol_compatible":false},"opencode":{"state":"unknown","service_version":null},"schedules":{"pending":null,"blocked":null,"failed":null,"admission_unconfirmed":null}})
+    json!({"installed":{"binary":paths.binary().exists(),"plugin":installed_plugin_path(paths).is_some()},"plugin_host":{"state":"unknown"},"daemon":{"reachable":false,"protocol_compatible":false},"opencode":{"state":"unknown","service_version":null},"schedules":{"pending":null,"blocked":null,"failed":null,"admission_unconfirmed":null}})
+}
+pub async fn observed_absent_status(paths: &Paths) -> Value {
+    let mut value = absent_status(paths);
+    if let Some(plugin) = installed_plugin_path(paths)
+        && let Ok(mut adapter) = crate::adapter::Adapter::new()
+        && let Ok(info) = adapter.discover().await
+    {
+        value["opencode"] = json!({"state":"ready","service_version":info.version});
+        value["plugin_host"]["state"] = json!(adapter.plugin_host_state(&plugin).await);
+    }
+    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_plugin_requires_payload_and_matching_private_configuration() {
+        // Catches hardcoded status, stale metadata, or a config pointing at another store.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            root: dir.path().join("data"),
+        };
+        fs::create_dir_all(paths.command_dir()).unwrap();
+        fs::write(paths.binary(), "fixture").unwrap();
+        let plugin = dir.path().join("plugin");
+        fs::create_dir_all(plugin.join("dist")).unwrap();
+        fs::write(
+            plugin.join("package.json"),
+            r#"{"name":"opencode-scheduler-plugin","type":"module","exports":{".":"./dist/index.js"}}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("dist/index.js"), "fixture").unwrap();
+        write_json(
+            &paths.file("product-install.json"),
+            &json!({"protocol":1,"plugin_path":plugin}),
+        )
+        .unwrap();
+        write_json(
+            &plugin.join("install.json"),
+            &json!({"protocol":1,"binary":paths.binary(),"data_home":paths.root}),
+        )
+        .unwrap();
+        assert_eq!(absent_status(&paths)["installed"]["plugin"], true);
+        assert_eq!(absent_status(&paths)["plugin_host"]["state"], "unknown");
+        write_json(
+            &plugin.join("install.json"),
+            &json!({"protocol":1,"binary":paths.binary(),"data_home":dir.path()}),
+        )
+        .unwrap();
+        assert_eq!(absent_status(&paths)["installed"]["plugin"], false);
+        write_json(
+            &plugin.join("install.json"),
+            &json!({"protocol":1,"binary":paths.binary(),"data_home":paths.root}),
+        )
+        .unwrap();
+        assert_eq!(absent_status(&paths)["installed"]["plugin"], true);
+        fs::remove_file(plugin.join("dist/index.js")).unwrap();
+        assert_eq!(absent_status(&paths)["installed"]["plugin"], false);
+    }
 
     #[tokio::test]
     async fn rpc_from_an_older_daemon_canonicalizes_nested_errors() {

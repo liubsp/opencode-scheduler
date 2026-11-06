@@ -28,14 +28,10 @@ jobs:
       - run: cargo build --locked
       - run: npm ci --prefix plugin
       - run: npm run check --prefix plugin
-      - run: npm test --prefix plugin
-      - run: npm audit --omit=dev --prefix plugin
       - name: Build and audit release
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (Test-Path scripts/install.ps1) {
-            ./scripts/build-release.ps1
-          } else {
-            ./scripts/build-release.ps1 -PayloadOnly
-          }
+          ./scripts/build-release.ps1
+      - run: npm test --prefix plugin
+      - run: npm audit --omit=dev --prefix plugin

@@ -71,6 +71,9 @@ fn help_teaches_every_visible_command_and_time_contract() {
                 "admission",
                 "completion",
                 "Examples:",
+                "PowerShell 7.3+",
+                "Standard",
+                "UTF-8",
             ],
         ),
         (vec!["schedule", "list"], vec!["1-100", "cursor", "prompt"]),
@@ -204,6 +207,11 @@ async fn human_output_is_readable_for_all_operations() {
     ] {
         assert!(text.contains(id));
         assert!(text.contains("ses_a"));
+        assert!(text.contains("Pilot exact"));
+        assert!(
+            !text.contains("fixture"),
+            "Prompt bodies stay private: {text}"
+        );
         assert!(text.contains("pending"));
         assert!(
             text.contains(
@@ -298,6 +306,7 @@ fn json_automation_contract_unchanged() {
         cli(&home, &state, &["status"]),
         json!({"ok":true,"result":{"kind":"status","data":{
             "installed":{"binary":false,"plugin":false},
+            "plugin_host":{"state":"unknown"},
             "daemon":{"reachable":false,"protocol_compatible":false},
             "opencode":{"state":"unknown","service_version":null},
             "schedules":{"pending":null,"blocked":null,"failed":null,"admission_unconfirmed":null}
@@ -585,6 +594,90 @@ async fn install_preserves_store_and_handles_running_binary() {
     server.abort();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_install_rejects_existing_links_without_writes_or_daemon_shutdown() {
+    use std::{fs, os::unix::fs::symlink};
+    let _fixture = CLI_FIXTURES.lock().await;
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = home.path().join("private");
+    let _cleanup = DaemonCleanup(root.clone());
+    cli(&home, &state, &["install", "--no-path"]);
+    cli(&home, &state, &["daemon", "start"]);
+    let descriptor = fs::read(root.join("endpoint.json")).unwrap();
+    for relative in [
+        "app/bin",
+        "install.json",
+        "endpoint.json",
+        "startup.lock",
+        "dangling",
+    ] {
+        let path = root.join(if relative == "dangling" {
+            "app/bin"
+        } else {
+            relative
+        });
+        let parked = root.join("parked");
+        let outside = home.path().join("outside");
+        let is_dir = path.is_dir();
+        let bytes = if is_dir {
+            b"outside sentinel".to_vec()
+        } else {
+            fs::read(&path).unwrap()
+        };
+        if is_dir {
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("sentinel"), &bytes).unwrap();
+        } else {
+            fs::write(&outside, &bytes).unwrap();
+        }
+        fs::rename(&path, &parked).unwrap();
+        symlink(
+            if relative == "dangling" {
+                home.path().join("missing")
+            } else {
+                outside.clone()
+            },
+            &path,
+        )
+        .unwrap();
+        let before = fs::read_dir(&root).unwrap().count();
+        let out = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+            .env("OPENCODE_SCHEDULER_HOME", &root)
+            .env("XDG_STATE_HOME", state.path())
+            .args(["install", "--no-path", "--json"])
+            .output()
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::rename(&parked, &path).unwrap();
+        assert!(!out.status.success());
+        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(error["error"]["code"], "private_directory_failure");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+        assert_eq!(fs::read(root.join("endpoint.json")).unwrap(), descriptor);
+        assert_eq!(
+            fs::read(if is_dir {
+                outside.join("sentinel")
+            } else {
+                outside.clone()
+            })
+            .unwrap(),
+            bytes
+        );
+        if is_dir {
+            fs::remove_dir_all(outside).unwrap();
+        } else {
+            fs::remove_file(outside).unwrap();
+        }
+        assert_eq!(
+            cli(&home, &state, &["status"])["result"]["data"]["daemon"]["reachable"],
+            true
+        );
+    }
+    cli(&home, &state, &["daemon", "stop"]);
+}
+
 fn cli(home: &TempDir, state: &TempDir, args: &[&str]) -> Value {
     let out = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
         .env("OPENCODE_SCHEDULER_HOME", home.path().join("private"))
@@ -606,7 +699,7 @@ fn cli(home: &TempDir, state: &TempDir, args: &[&str]) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bare_powershell_create_preserves_literal_prompt_arguments() {
     let _fixture = CLI_FIXTURES.lock().await;
-    // Catches command-interpreter expansion of literal prompt text on the installed path.
+    // Exercise the documented caller-shell recipes, not just direct process argv.
     let home = tempfile::Builder::new()
         .prefix("scheduler literal spaces ")
         .tempdir()
@@ -622,33 +715,55 @@ async fn bare_powershell_create_preserves_literal_prompt_arguments() {
     let mut isolated_path = paths.command_dir().into_os_string();
     isolated_path.push(";");
     isolated_path.push(std::env::var_os("PATH").unwrap_or_default());
-    let prompt = "Keep %SCHEDULER_LITERAL_PROBE% and %MISSING_LITERAL_PROBE% literal; & | < > ^ ! ( ) $value `tick 'single' — åäö 日本語 with spaces";
     let at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-    let out = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command",
-            "if (@(Get-Command opencode-scheduler -CommandType Application)[0].Source -ne $env:SCHEDULER_TEST_BINARY) { throw 'Unexpected installed command' }; opencode-scheduler schedule create --session ses_a --at $env:SCHEDULER_TEST_AT --prompt $env:SCHEDULER_TEST_PROMPT --json; exit $LASTEXITCODE"])
-        .current_dir(home.path())
-        .env("OPENCODE_SCHEDULER_HOME", &root)
-        .env("XDG_STATE_HOME", state.path())
-        .env("PATH", isolated_path)
-        .env("SCHEDULER_LITERAL_PROBE", "expanded-by-cmd")
-        .env_remove("MISSING_LITERAL_PROBE")
-        .env("SCHEDULER_TEST_AT", at)
-        .env("SCHEDULER_TEST_BINARY", paths.binary())
-        .env("SCHEDULER_TEST_PROMPT", prompt)
-        .output().unwrap();
-    assert!(
-        out.status.success(),
-        "{} {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let created: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let id = created["result"]["data"]["schedules"][0]["id"]
-        .as_str()
-        .unwrap();
-    let stored = cli(&home, &state, &["schedule", "show", id]);
-    assert_eq!(stored["result"]["data"]["prompt"], prompt);
+    for (shell, prompt) in [
+        (
+            "powershell.exe",
+            "Keep %SCHEDULER_LITERAL_PROBE% and %MISSING_LITERAL_PROBE% literal; & | < > ^ ! ( ) $value `tick 'single' — åäö 日本語 with spaces",
+        ),
+        (
+            "pwsh.exe",
+            "Say \"hello\" exactly\r\nKeep %SCHEDULER_LITERAL_PROBE% and %MISSING_LITERAL_PROBE% literal; & | < > ^ ! ( ) $value `tick 'single' — åäö 日本語 with spaces\nBackslashes: folder\\subfolder\\ \"quoted\\path\\\" end\\",
+        ),
+    ] {
+        let script = home.path().join("literal-recipe.ps1");
+        let setup = if shell == "pwsh.exe" {
+            // UTF-8 without BOM is PowerShell 7's script encoding; single-quoted
+            // here-strings preserve embedded quotes, backslashes and line endings.
+            std::fs::write(&script, format!(
+                "if ($PSVersionTable.PSVersion -lt [version]'7.3') {{ throw 'PowerShell 7.3+ required' }}\n$PSNativeCommandArgumentPassing = 'Standard'\n$prompt = @'\n{prompt}\n'@\nif (@(Get-Command opencode-scheduler -CommandType Application)[0].Source -ne $env:SCHEDULER_TEST_BINARY) {{ throw 'Unexpected installed command' }}\nopencode-scheduler schedule create --session ses_a --at $env:SCHEDULER_TEST_AT --prompt $prompt --json\nexit $LASTEXITCODE\n"
+            )).unwrap();
+            vec!["-File".into(), script.into_os_string()]
+        } else {
+            vec!["-Command".into(), "if (@(Get-Command opencode-scheduler -CommandType Application)[0].Source -ne $env:SCHEDULER_TEST_BINARY) { throw 'Unexpected installed command' }; opencode-scheduler schedule create --session ses_a --at $env:SCHEDULER_TEST_AT --prompt $env:SCHEDULER_TEST_PROMPT --json; exit $LASTEXITCODE".into()]
+        };
+        let out = Command::new(shell)
+            .args(["-NoProfile", "-NonInteractive"])
+            .args(setup)
+            .current_dir(home.path())
+            .env("OPENCODE_SCHEDULER_HOME", &root)
+            .env("XDG_STATE_HOME", state.path())
+            .env("PATH", &isolated_path)
+            .env("SCHEDULER_LITERAL_PROBE", "expanded-by-cmd")
+            .env_remove("MISSING_LITERAL_PROBE")
+            .env("SCHEDULER_TEST_AT", &at)
+            .env("SCHEDULER_TEST_BINARY", paths.binary())
+            .env("SCHEDULER_TEST_PROMPT", prompt)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{shell}: {} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let created: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let id = created["result"]["data"]["schedules"][0]["id"]
+            .as_str()
+            .unwrap();
+        let stored = cli(&home, &state, &["schedule", "show", id]);
+        assert_eq!(stored["result"]["data"]["prompt"], prompt);
+    }
     cli(&home, &state, &["daemon", "stop"]);
     server.abort();
 }

@@ -19,7 +19,21 @@ opencode-scheduler schedule create --session ses_example --at '2099-11-06T14:00:
 opencode-scheduler schedule create --session-title 'Exact title' --at '5:00' --prompt 'Resume the task' --delivery queue
 ```
 
-Replace example values with the user's instructions. Choose either `--session` (one ID) or `--session-title 'Exact title'`: title selection freezes **ALL exact matches**, not just the current session. Confirm that fanout is intended. `steer` is the default; `queue` waits behind current work. Preserve prompt text literally, including whitespace, quotes, `$`, `@` and newlines; shell quoting must not interpolate it. The scheduler does no command/file expansion.
+Replace example values with the user's instructions. Choose either `--session` (one ID) or `--session-title 'Exact title'`: title selection freezes **ALL exact matches**, not just the current session. Confirm that fanout is intended. `steer` is the default; `queue` waits behind current work. The scheduler does no command/file expansion, but caller-shell argument rules still apply.
+
+Windows PowerShell 5.1 supports the simple examples above, but can strip embedded double quotes or alter adjacent backslashes even inside a variable. For exact quoted/multiline prompts, open PowerShell 7.3+ (`pwsh`) and run this recipe there; do not forward the prompt through a legacy shell. Save recipe scripts as UTF-8 (a BOM is optional in PowerShell 7).
+
+```powershell
+if ($PSVersionTable.PSVersion -lt [version]'7.3') { throw 'PowerShell 7.3+ required' }
+$PSNativeCommandArgumentPassing = 'Standard'
+$prompt = @'
+Say "hello" exactly.
+Keep folder\subfolder\ and $variables literal.
+'@
+opencode-scheduler schedule create --session ses_example --at '2099-11-06T14:00:00+01:00' --prompt $prompt
+```
+
+Use a single-quoted here-string to avoid interpolation; its closing `'@` must be on its own line. Delimiter line breaks are excluded; interior line endings are preserved. If the text contains that closing line, pass an existing exact string variable instead. Never guess/reinsert quotes lost by a shell. The prompt limit is 65536 UTF-8 bytes. Confirm the resolved session IDs/titles and full datetime printed by create; routine summaries suppress prompt bodies.
 
 Create prints a request UUID to stderr before contacting the daemon. Retain it with the original inputs. If the response is lost or uncertain, retry only the identical command with `--request-id` set to that UUID; never generate a new ID for the same uncertain create. A replay returns the original frozen batch; changed inputs conflict. Aborting a CLI wait does not cancel accepted schedules.
 

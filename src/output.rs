@@ -14,12 +14,13 @@ fn text(value: &Value) -> String {
 }
 fn schedule(s: &Value) -> String {
     let mut out = format!(
-        "{}  {}  {}  {}  {}\n  Attempts: {}/6; admission: {}; next attempt: {}\n",
+        "{}  {}  {}  {}  {}\n  Target title: {}\n  Attempts: {}/6; admission: {}; next attempt: {}\n",
         text(&s["id"]),
         text(&s["target"]["session_id"]),
         text(&s["time"]["display"]),
         text(&s["state"]),
         text(&s["delivery"]),
+        text(&s["target"]["title"]),
         text(&s["attempts_used"]),
         text(&s["certainty"]),
         next_attempt(&s["next_attempt_at"])
@@ -104,12 +105,19 @@ pub fn render(value: &Value) -> Result<String, ApiError> {
             cursor(data, &mut out);
         }
         OperationResult::Status(_) => {
-            out.push_str(&format!("Binary: {}\nPlugin: {}\nDaemon: {}\nOpenCode: {} (version {})\nSchedules: {} pending, {} blocked, {} failed, {} admission unconfirmed\n",
+            out.push_str(&format!("Binary: {}\nPlugin payload: {}\nDaemon: {}\nOpenCode: {} (version {})\nSchedules: {} pending, {} blocked, {} failed, {} admission unconfirmed\n",
                 if data["installed"]["binary"] == true { "installed" } else { "not installed" },
-                if data["installed"]["plugin"] == true { "installed" } else { "not installed" },
+                if data["installed"]["plugin"] == true { "installed" } else { "missing or invalid" },
                 if data["daemon"]["reachable"] == true { "running" } else { "not running" },
                 text(&data["opencode"]["state"]), text(&data["opencode"]["service_version"]),
                 text(&data["schedules"]["pending"]), text(&data["schedules"]["blocked"]), text(&data["schedules"]["failed"]), text(&data["schedules"]["admission_unconfirmed"])));
+            out.push_str(&format!(
+                "Plugin host: {} (queried host location; payload presence is not host readiness)\n",
+                text(&data["plugin_host"]["state"])
+            ));
+            if data["installed"]["plugin"] == true && data["plugin_host"]["state"] != "active" {
+                out.push_str("Hint: check OpenCode's plugin list and explicit disable policy in this location; allow watched discovery to reload, then check status again. Do not restart OpenCode or override a disable policy.\n");
+            }
         }
         OperationResult::Stopping(_) => {
             out.push_str("Scheduler daemon stopped. Schedules preserved.\n")
@@ -129,7 +137,7 @@ mod tests {
         let schedule = json!({
             "id":"schedule-fixture", "request_id":"request-fixture", "created_at":"2026-11-06T00:00:00Z",
             "time":{"due_at":"2026-11-07T01:30:00Z","original":"2026-11-07 02:30","display":"2026-11-07 02:30:00 +01:00","timezone":"Europe/Stockholm"},
-            "target":{"session_id":"ses_fixture","title":"Fixture"}, "prompt":"private prompt",
+            "target":{"session_id":"ses_fixture","title":"Fixture\n\u{1b}[31m title"}, "prompt":"private prompt",
             "delivery":"queue", "message_id":"msg_fixture", "state":"failed", "admitted_at":null,
             "attempts_used":6, "next_attempt_at":null, "certainty":"unconfirmed", "lateness_ms":42,
             "last_error":{"code":"opencode_unavailable","message":"OpenCode service is unavailable."}
@@ -139,6 +147,7 @@ mod tests {
         for expected in [
             "schedule-fixture",
             "ses_fixture",
+            "Fixture  [31m title",
             "2026-11-07 02:30:00 +01:00",
             "failed",
             "6/6",
@@ -151,6 +160,7 @@ mod tests {
             assert!(text.contains(expected), "{text}");
         }
         assert!(!text.contains("private prompt"));
+        assert!(!text.contains('\u{1b}'));
         let text = render(&json!({"ok":true,"result":{"kind":"log","data":{"items":[{
             "seq":1,"schedule_id":"schedule-fixture","ordinal":2,"started_at":"2026-11-07T01:30:10Z","finished_at":"2026-11-07T01:30:11Z",
             "phase":"submit","outcome":"transient","certainty":"unconfirmed",

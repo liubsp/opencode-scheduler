@@ -147,7 +147,55 @@ fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     result
 }
 
+// Check existing entries themselves, including dangling links, before preparation,
+// candidate writes or authenticated shutdown. Unknown installation files are untouched.
+fn reject_linked_path(path: &Path) -> Result<(), ApiError> {
+    for part in path.ancestors() {
+        let meta = match fs::symlink_metadata(part) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(ApiError::coded("private_directory_failure")),
+        };
+        #[cfg(windows)]
+        let linked = {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        };
+        #[cfg(not(windows))]
+        let linked = meta.file_type().is_symlink();
+        if linked {
+            return Err(ApiError::coded("private_directory_failure"));
+        }
+    }
+    Ok(())
+}
+
 pub async fn install(paths: &Paths, register_path: bool) -> Result<(), ApiError> {
+    for path in [
+        paths.binary(),
+        paths.binary().with_extension("previous.exe"),
+    ]
+    .into_iter()
+    .chain(
+        [
+            "install.lock",
+            "install.json",
+            "startup.lock",
+            "daemon.lock",
+            "endpoint.json",
+            "diagnostic.log",
+            "diagnostic.log.1",
+            "schedules.sqlite3",
+            "schedules.sqlite3-wal",
+            "schedules.sqlite3-shm",
+            "schedules.sqlite3-journal",
+            "product-install.json",
+        ]
+        .map(|name| paths.file(name)),
+    ) {
+        reject_linked_path(&path)?;
+    }
     paths.prepare()?;
     let install_lock = private_file(&paths.file("install.lock"))?;
     install_lock

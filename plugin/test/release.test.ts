@@ -25,20 +25,6 @@ function nativeFixture() {
   bytes.writeUInt16LE(0x20b, 152);
   return bytes;
 }
-test("normal release fails clearly until the product installer exists", async (t) => {
-  if (process.platform !== "win32") return t.skip("Windows release builder");
-  try {
-    await readFile(join(root, "scripts/install.ps1"));
-    return t.skip("Installer supplied by Task 5");
-  } catch {}
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-File", join(root, "scripts/build-release.ps1")],
-    { encoding: "utf8", windowsHide: true },
-  );
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /scripts\/install.ps1.*required/i);
-});
 test("release scanner enforces exact layout, native strings and runtime privacy", async (t) => {
   const home = await mkdtemp(join(root, ".tmp/scanner-"));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -106,6 +92,7 @@ test("release scanner enforces exact layout, native strings and runtime privacy"
     "debug.pdb",
     "plugin/dist/index.js.map",
     "plugin/install.json",
+    "product-install.json",
     "plugin/node_modules/sdk.js",
   ]) {
     await mkdir(join(home, name, ".."), { recursive: true });

@@ -121,6 +121,12 @@ impl Service {
                 value["schedules"] =
                     serde_json::to_value(counts).map_err(|_| ApiError::storage())?;
                 value["opencode"] = serde_json::json!({"state":state,"service_version":version});
+                if state == "ready"
+                    && let Some(plugin) = crate::runtime::installed_plugin_path(&self.paths)
+                {
+                    value["plugin_host"]["state"] =
+                        serde_json::json!(adapter.plugin_host_state(&plugin).await);
+                }
                 Ok(OperationResult::Status(value))
             }
             Operation::DaemonStop(_) => {

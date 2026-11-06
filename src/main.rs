@@ -82,8 +82,11 @@ enum ScheduleCommand {
         /// Appointment: clock H:MM[:SS], local YYYY-MM-DD HH:MM[:SS], or RFC 3339 with offset.
         #[arg(long)]
         at: String,
-        /// Literal prompt text, passed unchanged (nonblank; at most 65536 UTF-8 bytes).
-        #[arg(long)]
+        /// Prompt text as received from the shell (nonblank; at most 65536 UTF-8 bytes).
+        #[arg(
+            long,
+            long_help = "Prompt text as received from the shell (nonblank; at most 65536 UTF-8 bytes). Windows PowerShell 5.1 legacy argument passing can remove embedded double quotes and alter adjacent backslashes. For quoted/multiline prompts, run in PowerShell 7.3+ (pwsh), set $PSNativeCommandArgumentPassing = 'Standard', and pass a single-quoted here-string variable with --prompt $prompt. Save recipe scripts as UTF-8. See the README/CLI skill for a complete recipe; do not forward the prompt through a legacy shell. The CLI cannot reconstruct text already changed by the shell."
+        )]
         prompt: String,
         /// OpenCode admission mode, not a guarantee of agent completion; see below.
         #[arg(long,default_value="steer",value_parser=["steer","queue"])]
@@ -152,13 +155,13 @@ async fn execute(cli: Cli) -> Result<Value, ApiError> {
         } => {
             if !paths.root.exists() {
                 return Ok(
-                    json!({"ok":true,"result":{"kind":"status","data":runtime::absent_status(&paths)}}),
+                    json!({"ok":true,"result":{"kind":"status","data":runtime::observed_absent_status(&paths).await}}),
                 );
             }
             return match runtime::discover_daemon(&paths).await? {
                 Some(endpoint) => runtime::rpc(&endpoint, &Operation::Status(EmptyInput {})).await,
                 None => Ok(
-                    json!({"ok":true,"result":{"kind":"status","data":runtime::absent_status(&paths)}}),
+                    json!({"ok":true,"result":{"kind":"status","data":runtime::observed_absent_status(&paths).await}}),
                 ),
             };
         }

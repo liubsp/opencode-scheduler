@@ -185,6 +185,34 @@ impl Adapter {
         // Observation only, including status. Registration/auth rotation is read each cycle.
         self.probe().await
     }
+    pub async fn plugin_host_state(&self, plugin: &std::path::Path) -> &'static str {
+        let Ok((status, value)) = self.request(Method::GET, "/api/plugin", None).await else {
+            return "unknown";
+        };
+        if !status.is_success() {
+            return "unknown";
+        }
+        let Some(items) = value["data"].as_array() else {
+            return "unknown";
+        };
+        for item in items {
+            let same_path = item["source"]["path"].as_str().is_some_and(|p| {
+                std::fs::canonicalize(p)
+                    .ok()
+                    .zip(std::fs::canonicalize(plugin).ok())
+                    .is_some_and(|(a, b)| a == b)
+            });
+            if item["id"] == "opencode-scheduler" && item["source"]["type"] == "local" && same_path
+            {
+                return match item["state"]["status"].as_str() {
+                    Some("failed") => "failed",
+                    Some("active") if item["features"]["server"] == true => "active",
+                    _ => "unknown",
+                };
+            }
+        }
+        "not_loaded"
+    }
     async fn ensure(&mut self) -> Result<ServiceInfo, ApiError> {
         self.ensure_with(
             crate::bootstrap::command(),
@@ -534,6 +562,53 @@ mod tests {
             command.env("SCHEDULER_FIXTURE_HANG", "1");
         }
         command
+    }
+
+    #[tokio::test]
+    async fn plugin_host_status_requires_active_server_from_the_installed_path() {
+        // Catches interpreting installed, disabled, failed or same-ID other-path as loaded.
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("plugin");
+        std::fs::create_dir(&plugin).unwrap();
+        for (data, expected) in [
+            (json!([]), "not_loaded"),
+            (
+                json!([{"id":"opencode-scheduler","source":{"type":"local","path":plugin},"features":{"server":true},"state":{"status":"active"}}]),
+                "active",
+            ),
+            (
+                json!([{"id":"opencode-scheduler","source":{"type":"local","path":plugin},"features":{"server":true},"state":{"status":"failed","error":"private error"}}]),
+                "failed",
+            ),
+            (
+                json!([{"id":"opencode-scheduler","source":{"type":"local","path":dir.path()},"features":{"server":true},"state":{"status":"active"}}]),
+                "not_loaded",
+            ),
+            (
+                json!([{"id":"opencode-scheduler","source":{"type":"local","path":plugin},"features":{},"state":{"status":"active"}}]),
+                "unknown",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().route(
+                "/api/plugin",
+                get(move || {
+                    let data = data.clone();
+                    async move { Json(json!({"location":{"directory":null},"data":data})) }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut adapter = Adapter::from_record(dir.path().join("unused")).unwrap();
+            adapter.record = Some(Record {
+                url,
+                pid: 42,
+                version: None,
+                password: None,
+            });
+            assert_eq!(adapter.plugin_host_state(&plugin).await, expected);
+            server.abort();
+        }
     }
 
     #[tokio::test]
