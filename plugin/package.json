@@ -11,21 +11,21 @@
     ".": "./dist/index.js"
   },
   "files": [
-    "dist/*.js",
-    "LICENSE"
+    "dist/index.js",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.txt"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json --noEmit && node ../scripts/build-plugin.mjs",
     "format": "prettier --write src test *.json",
     "check": "prettier --check src test *.json && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "npm run build && tsx --test test/*.test.ts",
     "prepack": "npm run build"
   },
-  "dependencies": {
-    "@opencode/plugin": "2.2.0"
-  },
   "devDependencies": {
+    "@opencode/plugin": "2.2.0",
     "@types/node": "^22.0.0",
+    "esbuild": "0.28.2",
     "prettier": "3.6.2",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
@@ -57,17 +57,17 @@ test("host environment proxy settings cannot receive scheduler credentials", asy
   const address = proxy.address();
   assert.ok(address && typeof address !== "string");
   const proxyURL = `http://127.0.0.1:${address.port}`;
+  await mkdir(join(f.home, "dist"));
+  const bundled = join(f.home, "dist/index.mjs");
+  await copyFile(
+    fileURLToPath(new URL("../dist/index.js", import.meta.url)),
+    bundled,
+  );
   const script =
-    "import {pathToFileURL} from 'node:url'; const {SchedulerClient}=await import(pathToFileURL(process.argv[1])); const c=new SchedulerClient(process.argv[2]); console.log(JSON.stringify(await c.call('schedule_list',{}))); c.dispose()";
+    "import {pathToFileURL} from 'node:url'; const {default:p}=await import(pathToFileURL(process.argv[1])); const tools=[]; const close=await p.setup({tool:{transform:async edit=>{edit({add:t=>tools.push(t)});return {dispose:async()=>{}}}}}); const reply=await tools.find(t=>t.name==='scheduler_list').execute({}, {signal:new AbortController().signal}); console.log(reply.content[0].text); await close()";
   const { stdout } = await promisify(execFile)(
     process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      script,
-      fileURLToPath(new URL("../dist/client.js", import.meta.url)),
-      f.configPath,
-    ],
+    ["--input-type=module", "-e", script, bundled],
     {
       windowsHide: true,
       timeout: 10000,

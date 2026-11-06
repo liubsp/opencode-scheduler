@@ -1,4 +1,4 @@
-import { Plugin } from "@opencode/plugin";
+import * as Plugin from "@opencode/plugin/promise/plugin";
 import { SchedulerClient, uuidPattern } from "./client.js";
 
 const id = { type: "string", pattern: uuidPattern };

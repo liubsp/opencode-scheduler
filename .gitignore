@@ -7,5 +7,6 @@
 /plugin/dist/
 /plugin/node_modules/
 /plugin/install.json
+/plugin/THIRD-PARTY-NOTICES.txt
 *.tgz
 *.log
