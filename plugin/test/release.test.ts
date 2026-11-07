@@ -56,7 +56,8 @@ test("release scanner enforces exact layout, native strings and runtime privacy"
       [join(root, "scripts/check-package.mjs"), home],
       { encoding: "utf8" },
     );
-  assert.equal(scan().status, 0, scan().stderr);
+  const initialScan = scan();
+  assert.equal(initialScan.status, 0, initialScan.stderr);
   const debug = nativeFixture();
   debug.writeUInt32LE(1, 152 + 112 + 6 * 8);
   await writeFile(join(home, files[0]), debug);
@@ -101,14 +102,16 @@ test("release scanner enforces exact layout, native strings and runtime privacy"
     await rm(join(home, name));
   }
   await rm(join(home, "plugin/node_modules"), { recursive: true });
-  assert.equal(scan().status, 0, scan().stderr);
+  const restoredLayoutScan = scan();
+  assert.equal(restoredLayoutScan.status, 0, restoredLayoutScan.stderr);
   await mkdir(join(home, "unexpected-empty"));
   assert.notEqual(scan().status, 0);
   await rm(join(home, "unexpected-empty"), { recursive: true });
   await symlink(join(home, "plugin"), join(home, "linked"), "junction");
   assert.match(scan().stderr, /Link forbidden/);
   await rm(join(home, "linked"), { recursive: true });
-  assert.equal(scan().status, 0, scan().stderr);
+  const removedLinkScan = scan();
+  assert.equal(removedLinkScan.status, 0, removedLinkScan.stderr);
   for (const encoding of ["utf8", "utf16le", "utf16be"] as const) {
     for (const privateText of [
       root,
@@ -130,7 +133,8 @@ test("release scanner enforces exact layout, native strings and runtime privacy"
     }
   }
   await writeFile(join(home, files[0]), nativeFixture());
-  assert.equal(scan().status, 0, scan().stderr);
+  const restoredNativeScan = scan();
+  assert.equal(restoredNativeScan.status, 0, restoredNativeScan.stderr);
   await rm(join(home, "LICENSE"));
   assert.match(scan().stderr, /Missing files: LICENSE/);
 });

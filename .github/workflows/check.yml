@@ -27,11 +27,12 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked
       - run: npm ci --prefix plugin
-      - run: npm run check --prefix plugin
+        if: runner.os != 'Windows'
       - name: Build and audit release
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           ./scripts/build-release.ps1
+      - run: npm run check --prefix plugin
       - run: npm test --prefix plugin
       - run: npm audit --omit=dev --prefix plugin

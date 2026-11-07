@@ -22,11 +22,10 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked
-      - run: npm ci --prefix plugin
-      - run: npm run check --prefix plugin
       - name: Build and audit the same release payload
         shell: pwsh
         run: ./scripts/build-release.ps1
+      - run: npm run check --prefix plugin
       - run: npm test --prefix plugin
       - run: npm audit --omit=dev --prefix plugin
       - uses: actions/upload-artifact@v4
