@@ -51,7 +51,11 @@ function New-PrivateDirectory([string]$Path) {
     $acl.SetOwner($sid)
     $acl.SetAccessRuleProtection($true, $false)
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-    ([IO.DirectoryInfo]::new($Path)).Create($acl)
+    $directory = [IO.DirectoryInfo]::new($Path)
+    # Core moved ACL-aware creation to this built-in extension; both engines
+    # apply the private descriptor at creation, never after publication.
+    if ($PSVersionTable.PSEdition -eq 'Core') { [IO.FileSystemAclExtensions]::Create($directory, $acl) }
+    else { $directory.Create($acl) }
 }
 function Read-Json([string]$Path) {
     if ((Get-Item -LiteralPath $Path).Length -gt 65536) { Stop-Install 'Installation metadata is too large. Hint: preserve it and inspect it locally before repairing installation ownership.' }
@@ -69,6 +73,9 @@ function Write-PrivateJson([string]$Path, $Value) {
 
 try {
     if ($env:OS -ne 'Windows_NT') { Stop-Install 'This installer supports Windows x64 only. Hint: use the portable core build on other platforms; global installation there is not certified.' }
+    # A modern-shell/Node/Windows-PowerShell hop can inherit another engine's
+    # module search path. Resolve built-in hashing from this engine, locally.
+    Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -Scope Local -NoClobber
     if (!$DataHome) { $DataHome = Join-Path $env:LOCALAPPDATA 'opencode-scheduler' }
     if (!$ConfigHome) { $ConfigHome = Join-Path $HOME '.config' }
     foreach ($path in @($DataHome, $ConfigHome)) {

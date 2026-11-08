@@ -34,6 +34,7 @@ test("Windows expanded release installs owned payload, preserves data and verifi
     existsSync(join(release, "install.ps1")),
     "Build full release first: powershell -NoProfile -File scripts/build-release.ps1",
   );
+  await mkdir(join(tmpdir(), "opencode"), { recursive: true });
   const outside = await mkdtemp(join(tmpdir(), "opencode/scheduler-product-"));
   const unpacked = join(outside, "expanded release");
   await cp(release, unpacked, { recursive: true });
@@ -56,8 +57,9 @@ test("Windows expanded release installs owned payload, preserves data and verifi
   await writeFile(
     wrapper,
     `$ErrorActionPreference='Stop'
-Import-Module Microsoft.PowerShell.Utility
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1')
 $beforeUserPath = [Environment]::GetEnvironmentVariable('Path','User')
+$beforeModulePath = $env:PSModulePath
 # Model a discovery consumer retaining a child-directory handle when it sees a
 # complete module. Forward real hashing unchanged; observing at this boundary
 # avoids a timing-dependent race between the installer and a polling test host.
@@ -98,6 +100,7 @@ try {
 & (Join-Path $PSScriptRoot 'expanded release/install.ps1') -DataHome $env:OPENCODE_SCHEDULER_HOME -ConfigHome $env:XDG_CONFIG_HOME -NoPath
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ([Environment]::GetEnvironmentVariable('Path','User') -cne $beforeUserPath) { [Console]::Error.WriteLine('NoPath must preserve the persistent user PATH.'); exit 1 }
+if ($env:PSModulePath -cne $beforeModulePath) { [Console]::Error.WriteLine('Installer must preserve the caller module search path.'); exit 1 }
 $expected = Join-Path $env:OPENCODE_SCHEDULER_HOME 'app/bin/opencode-scheduler.exe'
 $command = Get-Command opencode-scheduler -ErrorAction SilentlyContinue
 if (!$command -or $command.Source -ne $expected) { [Console]::Error.WriteLine('Installer must refresh process PATH to its own native command.'); exit 1 }
@@ -111,17 +114,13 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
   );
   const run = (args: string[]) =>
     exec(native, args, { env, windowsHide: true, timeout: 120000 });
-  const install = (extra: NodeJS.ProcessEnv = {}) =>
-    exec(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-File", wrapper],
-      {
-        env: { ...env, ...extra },
-        cwd: outside,
-        windowsHide: true,
-        timeout: 240000,
-      },
-    );
+  const install = (extra: NodeJS.ProcessEnv = {}, engine = "powershell.exe") =>
+    exec(engine, ["-NoProfile", "-NonInteractive", "-File", wrapper], {
+      env: { ...env, ...extra },
+      cwd: outside,
+      windowsHide: true,
+      timeout: 240000,
+    });
   const untouched = join(config, "opencode/opencode.jsonc");
   const policy =
     '// preserve comments and explicit disable\r\n{"plugins":["*","-opencode-scheduler"],"skills":{"example":false}}\r\n';
@@ -351,7 +350,7 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$paths=$env:SCHEDULER_TEST_ACL_PATHS | ConvertFrom-Json; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $acls=@(foreach($path in $paths){$a=Get-Acl -LiteralPath $path; $rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); $other=@($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $sid }); if($other.Count){throw 'Payload must remain private'}; @{owner=$a.Owner; group=$a.Group; protected=$a.AreAccessRulesProtected; rules=@($rules | Select-Object @{n='sid';e={$_.IdentityReference.Value}},FileSystemRights,AccessControlType,InheritanceFlags,PropagationFlags,IsInherited)}}); ConvertTo-Json -InputObject $acls -Depth 5",
+        "$ErrorActionPreference='Stop'; Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'); $paths=$env:SCHEDULER_TEST_ACL_PATHS | ConvertFrom-Json; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $acls=@(foreach($path in $paths){$a=Get-Acl -LiteralPath $path; $rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); $other=@($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $sid }); if($other.Count){throw 'Payload must remain private'}; @{owner=$a.Owner; group=$a.Group; protected=$a.AreAccessRulesProtected; rules=@($rules | Select-Object @{n='sid';e={$_.IdentityReference.Value}},FileSystemRights,AccessControlType,InheritanceFlags,PropagationFlags,IsInherited)}}); ConvertTo-Json -InputObject $acls -Depth 5",
       ],
       {
         env: {
@@ -618,6 +617,27 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
       assert.deepEqual(
         repairedAcls.filter((_: unknown, index: number) => index !== 1),
         beforeAcls.filter((_: unknown, index: number) => index !== 1),
+      );
+    },
+  );
+  await t.test(
+    "direct PowerShell 7 reinstall preserves owned payload and private ACLs",
+    async () => {
+      const acls = await payloadAcls();
+      const bundle = await readFile(bundlePath);
+      const skill = await readFile(join(skillRoot, "SKILL.md"));
+      await install(retainTargets, "pwsh.exe");
+      assert.deepEqual(await readFile(bundlePath), bundle);
+      assert.deepEqual(await readFile(join(skillRoot, "SKILL.md")), skill);
+      assert.deepEqual(
+        JSON.parse(await readFile(join(plugin, "install.json"), "utf8")),
+        cfg,
+      );
+      assert.deepEqual(await payloadAcls(), acls);
+      assert.equal(await readFile(untouched, "utf8"), policy);
+      assert.equal(
+        (await run(["schedule", "show", id, "--json"])).stdout,
+        scheduleBeforeUpgrade,
       );
     },
   );

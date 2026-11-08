@@ -22,6 +22,7 @@ import { promisify } from "node:util";
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const exec = promisify(execFile);
 async function safetyFixture(t: TestContext) {
+  await mkdir(join(tmpdir(), "opencode"), { recursive: true });
   const outside = await mkdtemp(join(tmpdir(), "opencode/scheduler-safety-"));
   const release = join(outside, "release");
   const data = join(outside, "private");
