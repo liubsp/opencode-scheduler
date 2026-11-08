@@ -139,7 +139,13 @@ export async function fixture() {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );
-      await rm(home, { recursive: true, force: true });
+      // Allow bounded Windows handle-release lag; a still-busy fixture must fail.
+      await rm(home, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
     },
   };
 }
