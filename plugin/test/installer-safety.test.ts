@@ -52,7 +52,13 @@ async function safetyFixture(t: TestContext) {
     // Negative layout cases can deliberately create an endpoint.json *directory* on
     // the RED implementation; that is not a daemon descriptor to send stop through.
     if (daemonStarted) await native(["daemon", "stop"]);
-    await rm(outside, { recursive: true, force: true });
+    // Match the shared fixture's bounded Windows handle-release cleanup.
+    await rm(outside, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
   });
   await cp(join(root, ".tmp/release/expanded-zip"), release, {
     recursive: true,
