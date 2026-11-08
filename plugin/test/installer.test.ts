@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -251,7 +252,11 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
     "untouched plugin",
   );
   const cfg = JSON.parse(await readFile(join(plugin, "install.json"), "utf8"));
-  assert.deepEqual(cfg, { protocol: 1, binary: native, data_home: data });
+  assert.deepEqual(cfg, {
+    protocol: 1,
+    binary: await realpath(native),
+    data_home: await realpath(data),
+  });
   const skill = await readFile(
     join(config, "opencode/skills/opencode-scheduler/SKILL.md"),
     "utf8",
@@ -574,7 +579,7 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
       );
       assert.equal(backups.length, 1);
       assert.deepEqual(await readFile(join(stage, backups[0])), beforeBundle);
-      assert.ok(failureHint.includes(join(stage, backups[0])));
+      assert.ok(failureHint.includes(await realpath(join(stage, backups[0]))));
       assert.deepEqual(await payloadAcls(), beforeAcls);
       assert.equal(
         await readFile(join(busyDirectory, "keep.txt"), "utf8"),
