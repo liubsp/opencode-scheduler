@@ -61,14 +61,94 @@ function Read-Json([string]$Path) {
     if ((Get-Item -LiteralPath $Path).Length -gt 65536) { Stop-Install 'Installation metadata is too large. Hint: preserve it and inspect it locally before repairing installation ownership.' }
     Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
 }
+function Read-PrivateFileSecurity([string]$Path) {
+    $acl = [Security.AccessControl.FileSecurity]::new($Path, [Security.AccessControl.AccessControlSections]'Owner,Group,Access')
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+    if ($null -eq $raw.DiscretionaryAcl) { Stop-Install "Existing shared managed file at '$Path'. Hint: preserve it and explicitly establish a current-user-only DACL before reinstalling; unrestricted file access is not changed by the installer." }
+    foreach ($ace in $raw.DiscretionaryAcl) {
+        # Inspect qualified ACEs directly, including callback/object Allow ACEs
+        # that the convenience GetAccessRules projection can omit.
+        if ($ace -isnot [Security.AccessControl.QualifiedAce]) { Stop-Install "Managed file permissions at '$Path' cannot be verified as private. Hint: preserve the file and inspect its DACL locally before reinstalling." }
+        if ($ace.AceQualifier -eq 'AccessAllowed' -and !$ace.SecurityIdentifier.Equals($sid)) {
+            Stop-Install "Existing shared managed file at '$Path'. Hint: preserve it and review its sharing locally; explicitly restore current-user-only file access before reinstalling. The installer does not change sharing permissions."
+        }
+    }
+    return $acl
+}
+function Restore-ExactFileAccess([string]$Path, [Security.AccessControl.FileSecurity]$Original) {
+    # Modern ACL setters recompute inheritance from the current parent; ReplaceFile
+    # has already merged the private stage's inherited rules. The file-specific
+    # legacy API applies the saved DACL without that second inheritance calculation.
+    # AUTO_INHERIT_REQ retains its already-computed auto-inheritance control state.
+    # Verify the full owner/group/Access descriptor; there is no permissive fallback.
+    $raw = [Security.AccessControl.RawSecurityDescriptor]::new($Original.GetSecurityDescriptorBinaryForm(), 0)
+    $raw.SetFlags($raw.ControlFlags -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired)
+    $bytes = [byte[]]::new($raw.BinaryLength)
+    $raw.GetBinaryForm($bytes, 0)
+    [SchedulerInstaller.FileAcl]::SetDacl($Path, $bytes)
+}
+function Replace-PrivateFile([string]$Source, [string]$Destination, [string]$Backup) {
+    $sections = [Security.AccessControl.AccessControlSections]'Owner,Group,Access'
+    $original = Read-PrivateFileSecurity $Destination
+    $expected = $original.GetSecurityDescriptorSddlForm($sections)
+    # ReplaceFile retains DACL metadata, not the old owner/group. Prepare only
+    # differing ownership fields while the incoming file is still private.
+    $incoming = [Security.AccessControl.FileSecurity]::new($Source, [Security.AccessControl.AccessControlSections]'Owner,Group')
+    $changed = $false
+    $sidType = [Security.Principal.SecurityIdentifier]
+    if (!$incoming.GetOwner($sidType).Equals($original.GetOwner($sidType))) { $incoming.SetOwner($original.GetOwner($sidType)); $changed = $true }
+    if (!$incoming.GetGroup($sidType).Equals($original.GetGroup($sidType))) { $incoming.SetGroup($original.GetGroup($sidType)); $changed = $true }
+    if ($changed) {
+        $file = [IO.FileInfo]::new($Source)
+        if ($PSVersionTable.PSEdition -eq 'Core') { [IO.FileSystemAclExtensions]::SetAccessControl($file, $incoming) }
+        else { $file.SetAccessControl($incoming) }
+    }
+    # An original backup is mandatory before any fallible post-publication step.
+    # Only current-user Allow ACEs can be merged into an unpublished candidate.
+    [IO.File]::Replace($Source, $Destination, $Backup)
+    try {
+        $actual = [Security.AccessControl.FileSecurity]::new($Destination, $sections)
+        if ($actual.GetSecurityDescriptorSddlForm($sections) -cne $expected) {
+            Restore-ExactFileAccess $Destination $original
+            $actual = [Security.AccessControl.FileSecurity]::new($Destination, $sections)
+            if ($actual.GetSecurityDescriptorSddlForm($sections) -cne $expected) { throw 'File permission verification failed.' }
+        }
+    } catch {
+        $script:problem = 'Payload activation failed: permission metadata could not be preserved. Hint: preserve scheduler data and any reported recovery backup; check file permissions and files in use before retrying.'
+        throw
+    }
+}
+function Restore-OriginalFile([string]$Backup, [string]$Path) {
+    # File.Replace established the same-volume backup. This built-in no-UI
+    # Windows overwrite-rename restores the original file, streams and descriptor
+    # without merging ACLs or a fallible metadata write after consuming it.
+    [Microsoft.VisualBasic.FileIO.FileSystem]::MoveFile($Backup, $Path, $true)
+}
 function Write-PrivateJson([string]$Path, $Value) {
     # All callers write within a directory already protected for the current user.
     $tmp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    $backup = "$Path.previous-$([guid]::NewGuid().ToString('N'))"
+    $retainBackup = $false
     try {
         [IO.File]::WriteAllText($tmp, ($Value | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
-        if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($tmp, $Path, [NullString]::Value) }
-        else { [IO.File]::Move($tmp, $Path) }
-    } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
+        if (Test-Path -LiteralPath $Path) {
+            try { Replace-PrivateFile $tmp $Path $backup }
+            catch {
+                if (Test-Path -LiteralPath $backup) {
+                    try { Restore-OriginalFile $backup $Path }
+                    catch {
+                        $retainBackup = $true
+                        $script:problem += " Metadata rollback needs manual inspection at '$Path'; preserve the original private backup at '$backup'."
+                    }
+                }
+                throw
+            }
+        } else { [IO.File]::Move($tmp, $Path) }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        if (!$retainBackup -and (Test-Path -LiteralPath $backup)) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 try {
@@ -107,6 +187,7 @@ try {
     # The reused native installer stages/replaces the executable and may restart its
     # daemon. Check every fixed path those operations touch before any product writes.
     # Random candidate/metadata temporary names use these already-checked directories.
+    $privateFiles = @()
     foreach ($relative in @('app/bin/opencode-scheduler.exe', 'app/bin/opencode-scheduler.previous.exe',
         'install.lock', 'install.json', 'startup.lock', 'daemon.lock', 'endpoint.json',
         'diagnostic.log', 'diagnostic.log.1', 'schedules.sqlite3', 'schedules.sqlite3-wal',
@@ -116,9 +197,18 @@ try {
             Stop-Install 'Config-home overlaps a native executable or control-file path. Hint: use a dedicated config directory that does not occupy a native file path; no installation directories were created.'
         }
         Assert-RealPath $nativePath
+        $privateFiles += $nativePath
     }
     $pluginFiles = @('package.json', 'dist/index.js', 'LICENSE', 'THIRD-PARTY-NOTICES.txt')
     $skillFiles = @('SKILL.md')
+    foreach ($name in @($pluginFiles) + @('install.json')) { $privateFiles += Join-Path $pluginTarget $name }
+    foreach ($name in $skillFiles) { $privateFiles += Join-Path $skillTarget $name }
+    # Check every managed leaf before even creating the product lock or stages.
+    # An Administrators owner is not sharing: only outsider Allow ACEs are refused.
+    foreach ($file in $privateFiles) {
+        Assert-RealPath $file
+        if (Test-Path -LiteralPath $file -PathType Leaf) { [void](Read-PrivateFileSecurity $file) }
+    }
     Assert-RealTree $release
     foreach ($file in @('bin/opencode-scheduler.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'install.ps1') + @($pluginFiles | ForEach-Object { "plugin/$_" }) + @('skills/opencode-scheduler/SKILL.md')) {
         if (!(Test-Path -LiteralPath (Join-Path $release $file) -PathType Leaf)) {
@@ -147,6 +237,24 @@ try {
         Stop-Install 'Native payload could not be validated. Hint: use a trusted Windows x64 release compatible with this machine.'
     }
     $manifestPath = Join-Path $DataHome 'product-install.json'
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    if (!('SchedulerInstaller.FileAcl' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace SchedulerInstaller {
+    public static class FileAcl {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileSecurityW(string path, uint information, byte[] descriptor);
+        public static void SetDacl(string path, byte[] descriptor) {
+            if (!SetFileSecurityW(path, 4, descriptor)) // DACL_SECURITY_INFORMATION only
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+}
+'@
+    }
     # Serialize the complete product operation, including preflight and native upgrade.
     # This empty lock file contains no paths, configuration or credentials.
     $lockPath = Join-Path $ConfigHome 'opencode/.scheduler-install.lock'
@@ -154,6 +262,8 @@ try {
     New-Item -ItemType Directory -Path (Split-Path -Parent $lockPath) -Force | Out-Null
     $script:problem = 'Another product installation may be running, or the config directory is not writable. Hint: let that installer finish and check directory access before retrying.'
     $productLock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
+    # Recheck after serialization; the initial check is what makes refusal no-write.
+    foreach ($file in $privateFiles) { if (Test-Path -LiteralPath $file -PathType Leaf) { [void](Read-PrivateFileSecurity $file) } }
     $script:problem = 'Installation preflight failed. Hint: check directory ownership, free space and installation metadata locally; preserve existing files.'
     $manifest = $null
     if (Test-Path -LiteralPath $manifestPath) {
@@ -222,8 +332,8 @@ try {
         if ($hadTarget -and $manifest) {
             # A loaded host can retain descendant-directory handles that prevent an
             # ancestor rename. Keep existing directories/unfamiliar work in place;
-            # ReplaceFile (via .NET) atomically replaces each owned leaf, preserving
-            # its ACL. Backups stay private and outside discovery on the same volume.
+            # ReplaceFile retains streams/attributes; explicitly verify/restore its
+            # merged DACL while the original stays private outside discovery.
             foreach ($name in $names) {
                 $destination = Join-Path $target.Path $name
                 $parent = Split-Path -Parent $destination
@@ -234,7 +344,7 @@ try {
                 $backup = Join-Path $target.Stage ('.previous-' + [guid]::NewGuid().ToString('N'))
                 $exists = Test-Path -LiteralPath $destination
                 $backups += @{ Kind = 'file'; Path = $destination; Backup = $backup; HadTarget = $exists; Activated = $false; Stage = $target.Stage }
-                if ($exists) { [IO.File]::Replace((Join-Path $target.Stage $name), $destination, $backup) }
+                if ($exists) { Replace-PrivateFile (Join-Path $target.Stage $name) $destination $backup }
                 else { [IO.File]::Move((Join-Path $target.Stage $name), $destination) }
                 $backups[-1].Activated = $true
             }
@@ -290,8 +400,7 @@ try {
         try {
             if ($backup.Kind -eq 'file') {
                 if ($backup.HadTarget -and (Test-Path -LiteralPath $backup.Backup)) {
-                    if (Test-Path -LiteralPath $backup.Path) { [IO.File]::Replace($backup.Backup, $backup.Path, [NullString]::Value) }
-                    else { [IO.File]::Move($backup.Backup, $backup.Path) }
+                    Restore-OriginalFile $backup.Backup $backup.Path
                 } elseif ($backup.Activated) {
                     if ($backup.HadTarget) { throw 'Payload backup is missing.' }
                     [IO.File]::Delete($backup.Path)

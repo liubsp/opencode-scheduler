@@ -68,10 +68,22 @@ $global:schedulerTestDiscovery = [IO.Path]::GetFullPath((Join-Path $env:XDG_CONF
 $global:schedulerTestWatchers = [Collections.Generic.List[IO.FileSystemWatcher]]::new()
 $global:schedulerTestFiles = [Collections.Generic.List[IO.FileStream]]::new()
 $global:schedulerTestRollbackHeld = $false
+$aclBreakpoint = $null
+$global:schedulerTestAclInjected = $false
+$global:schedulerTestAclBefore = $null
+$global:schedulerTestAclRecoveryHeld = $false
 function Get-FileHash {
     param([string]$LiteralPath, [string]$Algorithm = 'SHA256')
     $hash = Microsoft.PowerShell.Utility\\Get-FileHash @PSBoundParameters
     $observed = [IO.Path]::GetFullPath($LiteralPath)
+    $stageParent = [IO.Path]::GetFullPath((Join-Path $env:XDG_CONFIG_HOME 'opencode'))
+    if ($observed.StartsWith($stageParent + '\\.scheduler-stage-', [StringComparison]::OrdinalIgnoreCase)) {
+        $a = [Security.AccessControl.FileSecurity]::new($observed,[Security.AccessControl.AccessControlSections]::Access)
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        foreach ($rule in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -eq 'Allow' -and !$rule.IdentityReference.Equals($sid)) { throw 'Unpublished payload must remain private.' }
+        }
+    }
     if ($observed.StartsWith($global:schedulerTestDiscovery + '\\.scheduler-stage-', [StringComparison]::OrdinalIgnoreCase) -and $observed.EndsWith('dist\\index.js')) {
         $watcher = [IO.FileSystemWatcher]::new((Split-Path -Parent $observed))
         $watcher.EnableRaisingEvents = $true
@@ -98,6 +110,27 @@ if ($busy) {
     $global:schedulerTestFiles.Add([IO.File]::Open($busy, 'Open', 'Read', 'Read'))
 }
 try {
+if ($env:SCHEDULER_TEST_FAIL_ACL_FILE) {
+    $sections = [Security.AccessControl.AccessControlSections]'Owner,Group,Access'
+    $global:schedulerTestAclBefore = [Security.AccessControl.FileSecurity]::new($env:SCHEDULER_TEST_FAIL_ACL_FILE,$sections).GetSecurityDescriptorSddlForm($sections)
+    # Observe a real metadata boundary without replacing the setter. A changed
+    # published file loses WRITE_DAC; its original backup is never modified.
+    $aclBreakpoint = Set-PSBreakpoint -Command Restore-ExactFileAccess -Action {
+        $entry = $env:SCHEDULER_TEST_FAIL_ACL_FILE
+        $sections = [Security.AccessControl.AccessControlSections]'Owner,Group,Access'
+        $a = [Security.AccessControl.FileSecurity]::new($entry,$sections)
+        if (!$global:schedulerTestAclInjected -and $a.GetSecurityDescriptorSddlForm($sections) -cne $global:schedulerTestAclBefore) {
+            $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-3-4'),'ChangePermissions','Deny'))
+            if ($PSVersionTable.PSEdition -eq 'Core') { [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($entry),$a) }
+            else { ([IO.FileInfo]::new($entry)).SetAccessControl($a) }
+            $global:schedulerTestAclInjected = $true
+            if ($env:SCHEDULER_TEST_LOCK_ACL_RECOVERY) {
+                $global:schedulerTestFiles.Add([IO.File]::Open($entry,'Open','Read','Read'))
+                $global:schedulerTestAclRecoveryHeld = $true
+            }
+        }
+    }
+}
 & (Join-Path $PSScriptRoot 'expanded release/install.ps1') -DataHome $env:OPENCODE_SCHEDULER_HOME -ConfigHome $env:XDG_CONFIG_HOME -NoPath
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ([Environment]::GetEnvironmentVariable('Path','User') -cne $beforeUserPath) { [Console]::Error.WriteLine('NoPath must preserve the persistent user PATH.'); exit 1 }
@@ -108,8 +141,11 @@ if (!$command -or $command.Source -ne $expected) { [Console]::Error.WriteLine('I
 opencode-scheduler --version
 if ($LASTEXITCODE -ne 0) { exit 1 }
 } finally {
+    if ($aclBreakpoint) { Remove-PSBreakpoint $aclBreakpoint }
     foreach ($file in $global:schedulerTestFiles) { $file.Dispose() }
     foreach ($watcher in $global:schedulerTestWatchers) { $watcher.Dispose() }
+    if ($env:SCHEDULER_TEST_FAIL_ACL_FILE -and !$global:schedulerTestAclInjected) { throw 'ACL failure must exercise a real published-file permission change.' }
+    if ($env:SCHEDULER_TEST_LOCK_ACL_RECOVERY -and !$global:schedulerTestAclRecoveryHeld) { throw 'Recovery failure must retain a real published-file handle.' }
 }
 `,
   );
@@ -122,6 +158,50 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
       windowsHide: true,
       timeout: 240000,
     });
+  const security = async (path: string) =>
+    (
+      await exec(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "$ErrorActionPreference='Stop'; $s=[Security.AccessControl.AccessControlSections]'Owner,Group,Access'; $p=$env:SCHEDULER_TEST_FILE; $a=if([IO.Directory]::Exists($p)){[Security.AccessControl.DirectorySecurity]::new($p,$s)}else{[Security.AccessControl.FileSecurity]::new($p,$s)}; $a.GetSecurityDescriptorSddlForm($s)",
+        ],
+        { env: { ...env, SCHEDULER_TEST_FILE: path }, windowsHide: true },
+      )
+    ).stdout.trim();
+  const stream = async (path: string) =>
+    (
+      await exec(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "$ErrorActionPreference='Stop'; [Console]::Write([string](Get-Content -LiteralPath $env:SCHEDULER_TEST_FILE -Stream user-note -Raw))",
+        ],
+        { env: { ...env, SCHEDULER_TEST_FILE: path }, windowsHide: true },
+      )
+    ).stdout;
+  const recoverFixtureFile = (backup: string, path: string) =>
+    exec(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::MoveFile($env:SCHEDULER_TEST_BACKUP,$env:SCHEDULER_TEST_FILE,$true)",
+      ],
+      {
+        env: {
+          ...env,
+          SCHEDULER_TEST_BACKUP: backup,
+          SCHEDULER_TEST_FILE: path,
+        },
+        windowsHide: true,
+      },
+    );
   const untouched = join(config, "opencode/opencode.jsonc");
   const policy =
     '// preserve comments and explicit disable\r\n{"plugins":["*","-opencode-scheduler"],"skills":{"example":false}}\r\n';
@@ -348,6 +428,35 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
   );
   const descriptorBeforeUpgrade = await readFile(join(plugin, "install.json"));
   const retainTargets = { SCHEDULER_TEST_RETAIN_TARGETS: "1" };
+  // Existing private installations need not grant every managed file FullControl.
+  // A replacement must retain inherited Modify, mixed explicit/inherited rules,
+  // and protected rules rather than importing its staging parent's permissions.
+  await exec(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `$ErrorActionPreference='Stop'
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$dist=Join-Path $env:XDG_CONFIG_HOME 'opencode/plugins/opencode-scheduler/dist'
+$a=[Security.AccessControl.DirectorySecurity]::new($dist,[Security.AccessControl.AccessControlSections]::Access)
+$a.SetAccessRuleProtection($true,$false)
+$a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'Modify','ContainerInherit,ObjectInherit','None','Allow'))
+([IO.DirectoryInfo]::new($dist)).SetAccessControl($a)
+foreach($path in @((Join-Path $env:XDG_CONFIG_HOME 'opencode/plugins/opencode-scheduler/install.json'),(Join-Path $env:OPENCODE_SCHEDULER_HOME 'product-install.json'))) {
+    $a=[Security.AccessControl.FileSecurity]::new()
+    $a.SetAccessRuleProtection($true,$false)
+    $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'Modify','Allow'))
+    ([IO.FileInfo]::new($path)).SetAccessControl($a)
+}
+$path=Join-Path $env:XDG_CONFIG_HOME 'opencode/skills/opencode-scheduler/SKILL.md'
+$a=[Security.AccessControl.FileSecurity]::new($path,[Security.AccessControl.AccessControlSections]::Access)
+$a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'Read','Allow'))
+([IO.FileInfo]::new($path)).SetAccessControl($a)`,
+    ],
+    { env, windowsHide: true, timeout: 120000 },
+  );
   const payloadAcls = async () => {
     const result = await exec(
       "powershell.exe",
@@ -355,7 +464,7 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$ErrorActionPreference='Stop'; Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'); $paths=$env:SCHEDULER_TEST_ACL_PATHS | ConvertFrom-Json; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $acls=@(foreach($path in $paths){$a=Get-Acl -LiteralPath $path; $rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); $other=@($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $sid }); if($other.Count){throw 'Payload must remain private'}; @{owner=$a.Owner; group=$a.Group; protected=$a.AreAccessRulesProtected; rules=@($rules | Select-Object @{n='sid';e={$_.IdentityReference.Value}},FileSystemRights,AccessControlType,InheritanceFlags,PropagationFlags,IsInherited)}}); ConvertTo-Json -InputObject $acls -Depth 5",
+        "$ErrorActionPreference='Stop'; Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'); $paths=$env:SCHEDULER_TEST_ACL_PATHS | ConvertFrom-Json; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $acls=@(foreach($path in $paths){$a=Get-Acl -LiteralPath $path; $rules=@($a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); $other=@($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $sid }); if($other.Count){throw 'Payload must remain private'}; @{owner=$a.Owner; group=$a.Group; protected=$a.AreAccessRulesProtected; sddl=$a.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]'Owner,Group,Access'); rules=@($rules | Select-Object @{n='sid';e={$_.IdentityReference.Value}},FileSystemRights,AccessControlType,InheritanceFlags,PropagationFlags,IsInherited)}}); ConvertTo-Json -InputObject $acls -Depth 5",
       ],
       {
         env: {
@@ -369,6 +478,7 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
             join(skillRoot, "SKILL.md"),
             data,
             join(data, "schedules.sqlite3"),
+            join(data, "product-install.json"),
           ]),
         },
         windowsHide: true,
@@ -376,6 +486,100 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
     );
     return JSON.parse(result.stdout);
   };
+  await t.test(
+    "shared managed payload and metadata are refused before installation writes",
+    async () => {
+      const lock = join(config, "opencode/.scheduler-install.lock");
+      for (const [path, inherited] of [
+        [join(plugin, "dist/index.js"), false],
+        [join(plugin, "dist/index.js"), true],
+        [join(plugin, "install.json"), false],
+        [join(skillRoot, "SKILL.md"), false],
+        [join(data, "product-install.json"), false],
+        [join(data, "install.json"), false],
+      ] as const) {
+        const aclPath = inherited ? join(plugin, "dist") : path;
+        const originalBytes = await readFile(path);
+        const endpointBytes = await readFile(join(data, "endpoint.json"));
+        const nativeBytes = await readFile(native);
+        await rm(lock, { force: true });
+        const shared = await exec(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; $p=$env:SCHEDULER_TEST_FILE; $s=[Security.AccessControl.AccessControlSections]::Access; $sid=[Security.Principal.SecurityIdentifier]::new('S-1-1-0'); if($env:SCHEDULER_TEST_INHERITED){$a=[Security.AccessControl.DirectorySecurity]::new($p,$s); $r=[Security.AccessControl.FileSystemAccessRule]::new($sid,'Read','ObjectInherit','None','Allow')}else{$a=[Security.AccessControl.FileSecurity]::new($p,$s); $r=[Security.AccessControl.FileSystemAccessRule]::new($sid,'Read','Allow')}; [Convert]::ToBase64String($a.GetSecurityDescriptorBinaryForm()); $a.AddAccessRule($r); (Get-Item -LiteralPath $p).SetAccessControl($a)",
+          ],
+          {
+            env: {
+              ...env,
+              SCHEDULER_TEST_FILE: aclPath,
+              ...(inherited ? { SCHEDULER_TEST_INHERITED: "1" } : {}),
+            },
+            windowsHide: true,
+          },
+        );
+        const sharedSecurity = await security(path);
+        const sharedParent = inherited ? await security(aclPath) : null;
+        try {
+          await assert.rejects(install(), (e: any) =>
+            /shared managed file/i.test(e.stderr),
+          );
+          assert.equal(await security(path), sharedSecurity);
+          if (inherited) assert.equal(await security(aclPath), sharedParent);
+          assert.deepEqual(await readFile(path), originalBytes);
+          assert.deepEqual(await readFile(native), nativeBytes);
+          assert.deepEqual(
+            await readFile(join(data, "endpoint.json")),
+            endpointBytes,
+          );
+          assert.equal(
+            existsSync(lock),
+            false,
+            "Refusal precedes even lock creation",
+          );
+          assert.equal(
+            (await readdir(join(config, "opencode"))).some((name) =>
+              name.startsWith(".scheduler-stage-"),
+            ),
+            false,
+          );
+        } finally {
+          await exec(
+            "powershell.exe",
+            [
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              "$ErrorActionPreference='Stop'; $p=$env:SCHEDULER_TEST_FILE; $a=if([IO.Directory]::Exists($p)){[Security.AccessControl.DirectorySecurity]::new()}else{[Security.AccessControl.FileSecurity]::new()}; $a.SetSecurityDescriptorBinaryForm([Convert]::FromBase64String($env:SCHEDULER_TEST_SECURITY),[Security.AccessControl.AccessControlSections]::Access); (Get-Item -LiteralPath $p).SetAccessControl($a)",
+            ],
+            {
+              env: {
+                ...env,
+                SCHEDULER_TEST_FILE: aclPath,
+                SCHEDULER_TEST_SECURITY: shared.stdout.trim(),
+              },
+              windowsHide: true,
+            },
+          );
+        }
+      }
+    },
+  );
+  await exec(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ErrorActionPreference='Stop'; Set-Content -LiteralPath $env:SCHEDULER_TEST_FILE -Stream user-note -NoNewline -Value 'preserve unfamiliar stream'",
+    ],
+    {
+      env: { ...env, SCHEDULER_TEST_FILE: join(plugin, "dist/index.js") },
+      windowsHide: true,
+    },
+  );
   const beforeAcls = await payloadAcls();
   // A normal repeat must not rename the loaded target, even for identical payload.
   await t.test(
@@ -387,6 +591,10 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
         manifestBeforeUpgrade,
       );
       assert.deepEqual(await payloadAcls(), beforeAcls);
+      assert.equal(
+        await stream(join(plugin, "dist/index.js")),
+        "preserve unfamiliar stream",
+      );
     },
   );
   const sourceExe = join(unpacked, "bin/opencode-scheduler.exe");
@@ -424,6 +632,7 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
     JSON.parse(metadataBeforeUpgrade.toString()),
   );
   assert.deepEqual(await payloadAcls(), beforeAcls);
+  assert.equal(await stream(bundlePath), "preserve unfamiliar stream");
   assert.equal(
     (await run(["schedule", "show", id, "--json"])).stdout,
     scheduleBeforeUpgrade,
@@ -466,6 +675,163 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
     await readFile(join(plugin, "user-note.txt"), "utf8"),
     "preserve unfamiliar file",
   );
+  for (const locked of [false, true]) {
+    await t.test(
+      `ACL restoration failure ${locked ? "retains the private original when recovery is locked" : "restores the original without another ACL merge"}`,
+      async () => {
+        const beforeBundle = await readFile(bundlePath);
+        const beforeManifest = await readFile(
+          join(data, "product-install.json"),
+        );
+        const candidate = Buffer.concat([
+          beforeBundle,
+          Buffer.from("\n// acl restoration candidate\n"),
+        ]);
+        await writeFile(sourceBundle, candidate);
+        let hint = "";
+        try {
+          await assert.rejects(
+            install({
+              ...retainTargets,
+              SCHEDULER_TEST_FAIL_ACL_FILE: bundlePath,
+              ...(locked ? { SCHEDULER_TEST_LOCK_ACL_RECOVERY: "1" } : {}),
+            }),
+            (e: any) => {
+              hint = e.stderr;
+              return (
+                /permission metadata could not be preserved/i.test(hint) &&
+                (!locked || /rollback needs manual inspection/i.test(hint))
+              );
+            },
+          );
+        } finally {
+          await writeFile(sourceBundle, beforeBundle);
+        }
+        if (locked) {
+          assert.deepEqual(await readFile(bundlePath), candidate);
+          const parent = join(config, "opencode");
+          const stages = (await readdir(parent)).filter((name) =>
+            name.startsWith(".scheduler-stage-"),
+          );
+          assert.equal(stages.length, 1);
+          const stage = join(parent, stages[0]);
+          const backups = (await readdir(stage)).filter((name) =>
+            name.startsWith(".previous-"),
+          );
+          assert.equal(backups.length, 1);
+          const backup = join(stage, backups[0]);
+          assert.deepEqual(await readFile(backup), beforeBundle);
+          assert.equal(await security(backup), beforeAcls[2].sddl);
+          assert.equal(await stream(backup), "preserve unfamiliar stream");
+          assert.ok(hint.includes(await realpath(backup)));
+          await exec(
+            "powershell.exe",
+            [
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              "$ErrorActionPreference='Stop'; $a=[Security.AccessControl.DirectorySecurity]::new($env:SCHEDULER_TEST_STAGE,[Security.AccessControl.AccessControlSections]::Access); $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; if(!$a.AreAccessRulesProtected){throw 'Recovery stage must be protected'}; foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){if($r.AccessControlType -eq 'Allow' -and !$r.IdentityReference.Equals($sid)){throw 'Recovery stage must be private'}}; Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::MoveFile($env:SCHEDULER_TEST_BACKUP,$env:SCHEDULER_TEST_FILE,$true)",
+            ],
+            {
+              env: {
+                ...env,
+                SCHEDULER_TEST_STAGE: stage,
+                SCHEDULER_TEST_BACKUP: backup,
+                SCHEDULER_TEST_FILE: bundlePath,
+              },
+              windowsHide: true,
+            },
+          );
+          await rm(stage, { recursive: true });
+        }
+        assert.deepEqual(await readFile(bundlePath), beforeBundle);
+        assert.deepEqual(
+          await readFile(join(data, "product-install.json")),
+          beforeManifest,
+        );
+        assert.deepEqual(await payloadAcls(), beforeAcls);
+        assert.equal(await stream(bundlePath), "preserve unfamiliar stream");
+        assert.equal(
+          (await readdir(join(config, "opencode"))).some((name) =>
+            name.startsWith(".scheduler-stage-"),
+          ),
+          false,
+        );
+      },
+    );
+  }
+  for (const locked of [false, true]) {
+    await t.test(
+      `private JSON ACL failure ${locked ? "retains its original when metadata recovery is locked" : "restores its original and rolls back payload changes"}`,
+      async () => {
+        const path = join(data, "product-install.json");
+        const original = path + ".fixture-original";
+        // Model a real first-installed legacy descriptor with no auto-inherited bit.
+        // Keep the fixture's prior descriptor/file intact for cleanup afterward.
+        await exec(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; $p=$env:SCHEDULER_TEST_FILE; $tmp=$p+'.fixture-candidate'; [IO.File]::WriteAllBytes($tmp,[IO.File]::ReadAllBytes($p)); [IO.File]::Move($p,$p+'.fixture-original'); [IO.File]::Move($tmp,$p); Set-Content -LiteralPath $p -Stream user-note -NoNewline -Value 'preserve unfamiliar stream'",
+          ],
+          { env: { ...env, SCHEDULER_TEST_FILE: path }, windowsHide: true },
+        );
+        try {
+          const before = await readFile(path);
+          const acls = await payloadAcls();
+          const bundle = await readFile(bundlePath);
+          let hint = "";
+          await assert.rejects(
+            install({
+              ...retainTargets,
+              SCHEDULER_TEST_FAIL_ACL_FILE: path,
+              ...(locked ? { SCHEDULER_TEST_LOCK_ACL_RECOVERY: "1" } : {}),
+            }),
+            (e: any) => {
+              hint = e.stderr;
+              return (
+                /permission metadata could not be preserved/i.test(hint) &&
+                (!locked ||
+                  /metadata rollback needs manual inspection/i.test(hint))
+              );
+            },
+          );
+          if (locked) {
+            const backups = (await readdir(data)).filter((name) =>
+              name.startsWith("product-install.json.previous-"),
+            );
+            assert.equal(backups.length, 1);
+            const backup = join(data, backups[0]);
+            assert.deepEqual(await readFile(backup), before);
+            assert.equal(await security(backup), acls[8].sddl);
+            assert.ok(hint.includes(await realpath(backup)));
+            assert.notEqual(await security(path), acls[8].sddl);
+            await recoverFixtureFile(backup, path);
+          }
+          assert.deepEqual(await readFile(path), before);
+          assert.deepEqual(await payloadAcls(), acls);
+          assert.deepEqual(await readFile(bundlePath), bundle);
+          assert.equal(
+            (await readdir(data)).some((name) =>
+              name.startsWith("product-install.json.previous-"),
+            ),
+            false,
+          );
+          assert.equal(
+            (await readdir(join(config, "opencode"))).some((name) =>
+              name.startsWith(".scheduler-stage-"),
+            ),
+            false,
+          );
+        } finally {
+          await recoverFixtureFile(original, path);
+        }
+        assert.deepEqual(await payloadAcls(), beforeAcls);
+      },
+    );
+  }
   await t.test(
     "unreplaceable skill file rolls back the changed plugin despite retained directory handles",
     async () => {
@@ -616,12 +982,20 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
       await install();
       assert.deepEqual(await readFile(bundlePath), beforeBundle);
       const repairedAcls = await payloadAcls();
-      // A missing directory has no descriptor to preserve; its replacement is
-      // explicitly private, while every surviving descriptor retains its rules.
+      // Neither a missing directory nor its missing file has a descriptor to
+      // preserve. Their replacements are private; surviving descriptors are exact.
       assert.equal(repairedAcls[1].protected, true);
+      assert.equal(repairedAcls[2].protected, false);
+      assert.equal(repairedAcls[2].rules.length, 1);
+      assert.equal(repairedAcls[2].rules[0].IsInherited, true);
+      assert.equal(repairedAcls[2].rules[0].FileSystemRights, 2032127);
       assert.deepEqual(
-        repairedAcls.filter((_: unknown, index: number) => index !== 1),
-        beforeAcls.filter((_: unknown, index: number) => index !== 1),
+        repairedAcls.filter(
+          (_: unknown, index: number) => index !== 1 && index !== 2,
+        ),
+        beforeAcls.filter(
+          (_: unknown, index: number) => index !== 1 && index !== 2,
+        ),
       );
     },
   );
