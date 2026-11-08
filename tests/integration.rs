@@ -649,12 +649,14 @@ async fn native_install_rejects_existing_links_without_writes_or_daemon_shutdown
             .args(["install", "--no-path", "--json"])
             .output()
             .unwrap();
+        // Observe installer effects before restoring the fixture's parked entry.
+        let after = fs::read_dir(&root).unwrap().count();
         fs::remove_file(&path).unwrap();
         fs::rename(&parked, &path).unwrap();
         assert!(!out.status.success());
         let error: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(error["error"]["code"], "private_directory_failure");
-        assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+        assert_eq!(after, before);
         assert_eq!(fs::read(root.join("endpoint.json")).unwrap(), descriptor);
         assert_eq!(
             fs::read(if is_dir {
