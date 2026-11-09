@@ -69,7 +69,6 @@ pub fn render(value: &Value) -> Result<String, ApiError> {
             for s in data["schedules"].as_array().ok_or_else(ApiError::storage)? {
                 out.push_str(&schedule(s));
             }
-            out.push_str("Six attempts maximum; retries after 10/20/40/80/160 seconds. Overdue work runs when the daemon resumes. Admission is not agent completion; unconfirmed means it may have been accepted.\n");
         }
         OperationResult::Schedule(_) => out.push_str(&schedule(data)),
         OperationResult::Page(_) => {
@@ -112,11 +111,11 @@ pub fn render(value: &Value) -> Result<String, ApiError> {
                 text(&data["opencode"]["state"]), text(&data["opencode"]["service_version"]),
                 text(&data["schedules"]["pending"]), text(&data["schedules"]["blocked"]), text(&data["schedules"]["failed"]), text(&data["schedules"]["admission_unconfirmed"])));
             out.push_str(&format!(
-                "Plugin host: {} (queried host location; payload presence is not host readiness)\n",
+                "Plugin host: {} (queried location)\n",
                 text(&data["plugin_host"]["state"])
             ));
             if data["installed"]["plugin"] == true && data["plugin_host"]["state"] != "active" {
-                out.push_str("Hint: check OpenCode's plugin list and explicit disable policy in this location; allow watched discovery to reload, then check status again. Do not restart OpenCode or override a disable policy.\n");
+                out.push_str("Hint: check this location's plugin list and disable policy; wait for discovery, then recheck status.\n");
             }
         }
         OperationResult::Stopping(_) => {

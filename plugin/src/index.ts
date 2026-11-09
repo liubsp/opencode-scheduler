@@ -11,12 +11,12 @@ const definitions = [
     name: "create",
     op: "schedule_create",
     description:
-      "Schedule a literal prompt once. Supply a UUID v4 request_id and retain it: an uncertain or aborted call may already be accepted. Retry only with the same UUID and identical input. ID selects one session; exact title freezes ALL matches in one batch. Abort/unload does not cancel accepted schedules. Times accept RFC3339 with offset or backend-supported local wall time; delivery defaults to steer.",
+      "Schedule a literal prompt once. ID selects one session; exact title freezes ALL matches. Retain request_id: uncertain/aborted calls may be accepted; retry only identical input with the same UUID. Abort/unload does not cancel schedules. Time: RFC 3339 with offset, local YYYY-MM-DD HH:MM[:SS], or H:MM[:SS] (next future local occurrence). Local DST gaps/overlaps are rejected. Admission is not agent completion.",
     properties: {
       request_id: {
         ...id,
         description:
-          "Caller-owned UUID v4, reused unchanged for explicit retries of this exact request.",
+          "UUID v4; reuse with identical input after a lost response.",
       },
       target: {
         type: "object",
@@ -59,7 +59,7 @@ const definitions = [
     name: "cancel",
     op: "schedule_cancel",
     description:
-      "Cancel a pending schedule. Already-admitted or uncertain admission is reported truthfully; it cannot be recalled.",
+      "Cancel pending delivery; cannot retract admission or guarantee cancellation if uncertain.",
     properties: { id },
     required: ["id"],
   },
@@ -74,8 +74,7 @@ const definitions = [
   {
     name: "status",
     op: "status",
-    description:
-      "Read scheduler status without starting the daemon. No scheduling or service changes.",
+    description: "Read scheduler status without starting either service.",
     properties: {},
     required: [],
   },

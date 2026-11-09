@@ -301,6 +301,6 @@ test("explicit-only skill contains retrievable, real CLI command examples", asyn
   assert.doesNotMatch(humanShow.stdout, /literal|\$\{text\}|@file|\/command/);
   const jsonShow = await run(["schedule", "show", schedule.id, "--json"]);
   assert.equal(JSON.parse(jsonShow.stdout).result.data.prompt, input.prompt);
-  assert.match(text, /Plain `list` and `show` omit prompt text/);
+  assert.match(text, /`list` and `show` summaries omit prompt text/);
   assert.match(text, /`opencode-scheduler schedule show <schedule-id> --json`/);
 });

@@ -27,53 +27,53 @@ const kinds: Record<string, string> = {
 };
 const messages: Record<string, string> = {
   invalid_input:
-    "Invalid scheduler input. Hint: use opencode-scheduler <command> --help for required arguments, UUIDs and limits.",
+    "Invalid scheduler input. Hint: see opencode-scheduler <command> --help.",
   invalid_time:
-    "Invalid --at time. Hint: use 5:00 or 05:00:30 (next local occurrence on the daemon host), '2099-11-06 05:00' (host local date), or 2099-11-06T05:00:00+01:00 (explicit offset).",
+    "Invalid --at time. Hint: use 5:00 (next local occurrence), '2099-11-06 05:00' (host local date), or 2099-11-06T05:00:00+01:00 (explicit offset).",
   time_in_past:
-    "The resolved appointment is no longer in the future. Hint: choose a future date, e.g. 2099-11-06T05:00:00+01:00 (explicit offset). A clock is not rolled forward again after validation; check schedule list before changing a lost-response request.",
+    "Appointment is no longer in the future; clocks are not rolled forward after validation. Hint: choose a future time. After a lost response, check schedule list before changing input.",
   local_time_invalid:
-    "Local time is ambiguous or nonexistent at a DST transition. Hint: choose another time or supply an explicit offset, e.g. 2099-11-06T05:00:00+01:00, to specify the intended instant.",
+    "Local time falls in a DST gap or overlap. Hint: choose another time or specify an explicit offset, e.g. 2099-11-06T05:00:00+01:00.",
   timezone_unavailable:
-    "The daemon host's local timezone could not be resolved. Hint: use an explicit offset, e.g. 2099-11-06T05:00:00+01:00, or repair the host timezone configuration.",
+    "Host timezone could not be resolved. Hint: use an explicit offset, e.g. 2099-11-06T05:00:00+01:00, or repair the host timezone.",
   missing_session:
-    "Target session does not exist. Hint: verify the session ID or exact title in OpenCode; --session-title selects ALL exact matches.",
+    "Target session not found. Hint: check the ID or exact title in OpenCode; --session-title selects ALL exact matches.",
   opencode_unavailable:
-    "OpenCode service is unavailable. Hint: run opencode-scheduler status and verify OpenCode is reachable. For a lost create response, reuse the same request ID and identical input.",
+    "OpenCode service is unavailable. Hint: run opencode-scheduler status and check OpenCode connectivity. After a lost create response, reuse the same request ID and identical input.",
   unsupported_service:
-    "OpenCode service is unsupported. Hint: use OpenCode V2 service version 2.2.0 or newer within major version 2; the CLI version may differ from the service.",
+    "Unsupported OpenCode service. Hint: use V2 service version 2.2.0 or newer within major version 2; CLI versions may differ.",
   unsupported_protocol:
-    "Scheduler protocol is unsupported. Hint: upgrade the CLI, daemon and plugin together using the reviewed installer; preserve existing schedules.",
+    "Unsupported scheduler protocol. Hint: upgrade the CLI, daemon and plugin together with the release installer.",
   storage_failure:
-    "Scheduler storage operation failed; the cause is unknown. Hint: check free disk space and private data-directory access, then inspect diagnostic.log locally and run opencode-scheduler status. Do not delete the database. Reuse the same request ID and identical input after a lost create response.",
+    "Storage failed; cause unknown. Hint: check free space and data-directory access; inspect diagnostic.log locally. Preserve the database. After a lost create response, reuse the same request ID and identical input.",
   storage_permission:
-    "Scheduler storage access was denied or is read-only. Hint: check data-directory ownership and write permissions for the current user; do not bypass private ACLs or delete the database.",
+    "Storage access denied or read-only. Hint: check data-directory ownership and write permissions; preserve private access and the database.",
   storage_full:
-    "Scheduler storage has no free space. Hint: free disk space on the data volume without deleting scheduler data, then check opencode-scheduler status. Reuse the same request ID and identical input for a lost create response.",
+    "Storage is full. Hint: free space without deleting scheduler data. After a lost create response, reuse the same request ID and identical input.",
   storage_busy:
-    "Scheduler storage is locked by another writer. Hint: close external database writers and check opencode-scheduler status; preserve the database. For a lost create response reuse the same request ID and identical input.",
+    "Storage is locked by another writer. Hint: close external database writers. After a lost create response, reuse the same request ID and identical input.",
   private_directory_failure:
-    "Private data-directory preparation or security validation failed. Hint: check ownership, permissions and free disk space; use a real directory, not a link. On Windows, use a filesystem with persistent ACL support. Do not weaken ACLs or delete existing scheduler data.",
+    "Private data-directory validation failed. Hint: check ownership, permissions and free space; use a real directory and, on Windows, a filesystem with persistent ACLs. Preserve data and private access.",
   private_directory_timeout:
-    "Private data-directory security helper exceeded its startup deadline. Hint: check host load and filesystem availability, then run opencode-scheduler status. Permissions were not bypassed; preserve scheduler data and reuse the same request ID and identical input for a lost create response.",
+    "Private-directory validation exceeded its deadline. Hint: check filesystem availability and host load, then run opencode-scheduler status. After a lost create response, reuse the same request ID and identical input.",
   daemon_startup_failure:
-    "Scheduler daemon startup failed. Hint: inspect diagnostic.log locally and check private-directory access and free disk space; then run opencode-scheduler daemon start. Preserve scheduler data; reuse the same request ID and identical input for a lost create response.",
+    "Scheduler startup failed. Hint: inspect diagnostic.log locally and check directory access and free space before running opencode-scheduler daemon start. After a lost create response, reuse the same request ID and identical input.",
   daemon_startup_timeout:
-    "Scheduler daemon startup exceeded its deadline. Hint: run opencode-scheduler status to see whether startup finished; inspect diagnostic.log locally if it did not. Reuse the same request ID and identical input for a lost create response.",
+    "Scheduler startup timed out. Hint: run opencode-scheduler status; startup may have finished. If absent, inspect diagnostic.log locally. After a lost create response, reuse the same request ID and identical input.",
   daemon_unavailable:
-    "Scheduler daemon connection failed; the operation may have been accepted. Hint: run opencode-scheduler status, then opencode-scheduler daemon start if absent. For create, reuse the same request ID and identical input; do not create a replacement request blindly.",
+    "Scheduler connection failed; the operation may have been accepted. Hint: run opencode-scheduler status, then daemon start if absent. For create, reuse the same request ID and identical input to avoid duplicates.",
   authentication_failure:
-    "Service authentication failed. Hint: verify the current user's OpenCode and scheduler registration and credentials; use the supported installer to repair registration. Do not bypass authentication or share credentials.",
+    "Service authentication failed. Hint: check the current user's OpenCode and scheduler registration and credentials locally; repair registration with the supported installer.",
   schedule_missing:
-    "Schedule does not exist. Hint: run opencode-scheduler schedule list and use a schedule UUID from that list, not a request ID.",
+    "Schedule not found. Hint: use a schedule UUID from opencode-scheduler schedule list, not a request ID.",
   already_admitted:
-    "Prompt is already admitted. Hint: cancellation cannot retract accepted work; inspect opencode-scheduler schedule show <id> and the target session. Admission does not mean agent completion.",
+    "Prompt already admitted; cancellation cannot retract it. Hint: inspect opencode-scheduler schedule show <id> and the target session. Admission is not agent completion.",
   outcome_uncertain:
-    "Prompt admission is unconfirmed. Hint: inspect opencode-scheduler schedule log <id> and the target session before taking action. Cancellation cannot guarantee retraction; a new request could duplicate delivery.",
+    "Prompt admission is unconfirmed; cancellation cannot guarantee retraction. Hint: inspect opencode-scheduler schedule log <id> and the target session. A new request risks duplicate delivery.",
   request_conflict:
-    "Request ID has different original input. Hint: replay with the same request ID and identical input. Use a new UUID only for an intentional separate appointment after checking schedule list.",
+    "Request ID already has different input. Hint: replay identical input. Check schedule list before using a new UUID for a separate appointment.",
   resource_limit:
-    "Scheduler resource limit exceeded. Hint: use --limit 1-100 for pages; reduce prompt size (maximum 65536 UTF-8 bytes) or narrow the target selection (maximum 100 recipients).",
+    "Scheduler limit exceeded. Hint: use --limit 1-100, prompts up to 65536 UTF-8 bytes and at most 100 recipients.",
 };
 class ClientError extends Error {}
 function fail(message: string): never {
@@ -310,7 +310,7 @@ async function start(config: Install, signal: AbortSignal): Promise<void> {
         error
           ? reject(
               new ClientError(
-                "Scheduler start/status helper did not complete. Hint: run opencode-scheduler status; the daemon may already be running. Inspect diagnostic.log locally if it is absent.",
+                "Scheduler start/status did not finish; the daemon may already be running. Hint: run opencode-scheduler status; if absent, inspect diagnostic.log locally.",
               ),
             )
           : resolve(),

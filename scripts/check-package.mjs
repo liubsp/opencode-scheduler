@@ -165,9 +165,7 @@ export async function scan(
     ].some((field) => Object.keys(pkg[field] || {}).length)
   )
     throw new Error("Runtime package dependencies forbidden");
-  console.log(
-    `Audited ${plugin ? "plugin" : "payload"} directory (${directory === resolve(directory) ? "absolute input" : "relative input"}).`,
-  );
+  console.log(`Audited ${plugin ? "plugin" : "payload"} directory.`);
 }
 
 if (

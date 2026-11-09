@@ -8,7 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$script:problem = 'Installation failed. Hint: check free disk space and directory ownership, preserve scheduler data, then rerun this installer.'
+$script:problem = 'Installation failed. Hint: check free space and directory ownership; preserve scheduler data before retrying.'
 $stages = @()
 $backups = @()
 $createdDirectories = @()
@@ -28,7 +28,7 @@ function Assert-RealPath([string]$Path) {
         try { $item = Get-Item -LiteralPath $part -Force -ErrorAction Stop }
         catch [System.Management.Automation.ItemNotFoundException] { }
         if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            Stop-Install 'Installation path contains a link. Hint: select real directories; no files were intentionally replaced through a link.'
+            Stop-Install 'Installation path contains a link. Hint: select real directories.'
         }
         $parent = Split-Path -Parent $part
         if ($parent -eq $part) { break }
@@ -40,7 +40,7 @@ function Assert-RealTree([string]$Path) {
     if (Test-Path -LiteralPath $Path) {
         foreach ($item in Get-ChildItem -LiteralPath $Path -Force -Recurse) {
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                Stop-Install 'Payload or installation contains a link. Hint: use an expanded release and real directories; preserve unfamiliar files separately.'
+                Stop-Install 'Payload or installation contains a link. Hint: use an expanded release and real directories.'
             }
         }
     }
@@ -58,20 +58,20 @@ function New-PrivateDirectory([string]$Path) {
     else { $directory.Create($acl) }
 }
 function Read-Json([string]$Path) {
-    if ((Get-Item -LiteralPath $Path).Length -gt 65536) { Stop-Install 'Installation metadata is too large. Hint: preserve it and inspect it locally before repairing installation ownership.' }
+    if ((Get-Item -LiteralPath $Path).Length -gt 65536) { Stop-Install 'Installation metadata is too large. Hint: preserve it for local inspection before repairing ownership.' }
     Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
 }
 function Read-PrivateFileSecurity([string]$Path) {
     $acl = [Security.AccessControl.FileSecurity]::new($Path, [Security.AccessControl.AccessControlSections]'Owner,Group,Access')
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
-    if ($null -eq $raw.DiscretionaryAcl) { Stop-Install "Existing shared managed file at '$Path'. Hint: preserve it and explicitly establish a current-user-only DACL before reinstalling; unrestricted file access is not changed by the installer." }
+    if ($null -eq $raw.DiscretionaryAcl) { Stop-Install "Existing shared managed file at '$Path'. Hint: preserve it, review sharing locally and restore current-user-only access before reinstalling." }
     foreach ($ace in $raw.DiscretionaryAcl) {
         # Inspect qualified ACEs directly, including callback/object Allow ACEs
         # that the convenience GetAccessRules projection can omit.
-        if ($ace -isnot [Security.AccessControl.QualifiedAce]) { Stop-Install "Managed file permissions at '$Path' cannot be verified as private. Hint: preserve the file and inspect its DACL locally before reinstalling." }
+        if ($ace -isnot [Security.AccessControl.QualifiedAce]) { Stop-Install "Cannot verify private permissions at '$Path'. Hint: preserve the file and inspect its permissions locally." }
         if ($ace.AceQualifier -eq 'AccessAllowed' -and !$ace.SecurityIdentifier.Equals($sid)) {
-            Stop-Install "Existing shared managed file at '$Path'. Hint: preserve it and review its sharing locally; explicitly restore current-user-only file access before reinstalling. The installer does not change sharing permissions."
+            Stop-Install "Existing shared managed file at '$Path'. Hint: preserve it, review sharing locally and restore current-user-only access before reinstalling."
         }
     }
     return $acl
@@ -115,7 +115,7 @@ function Replace-PrivateFile([string]$Source, [string]$Destination, [string]$Bac
             if ($actual.GetSecurityDescriptorSddlForm($sections) -cne $expected) { throw 'File permission verification failed.' }
         }
     } catch {
-        $script:problem = 'Payload activation failed: permission metadata could not be preserved. Hint: preserve scheduler data and any reported recovery backup; check file permissions and files in use before retrying.'
+        $script:problem = 'Payload activation failed: permission metadata could not be preserved. Hint: keep any reported recovery backup; check permissions and files in use before retrying.'
         throw
     }
 }
@@ -152,7 +152,7 @@ function Write-PrivateJson([string]$Path, $Value) {
 }
 
 try {
-    if ($env:OS -ne 'Windows_NT') { Stop-Install 'This installer supports Windows x64 only. Hint: use the portable core build on other platforms; global installation there is not certified.' }
+    if ($env:OS -ne 'Windows_NT') { Stop-Install 'This installer supports Windows x64 only.' }
     # A modern-shell/Node/Windows-PowerShell hop can inherit another engine's
     # module search path. Resolve built-in hashing from this engine, locally.
     Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -Scope Local -NoClobber
@@ -161,10 +161,10 @@ try {
     foreach ($path in @($DataHome, $ConfigHome)) {
         # IsPathRooted alone also accepts drive-relative and root-relative paths.
         if (![IO.Path]::IsPathRooted($path) -or [IO.Path]::GetPathRoot($path).Length -lt 3) {
-            Stop-Install 'Installation directories must be absolute Windows paths. Hint: pass -DataHome and -ConfigHome with full directory paths.'
+            Stop-Install 'Installation directories must be absolute Windows paths. Hint: use full paths for -DataHome and -ConfigHome.'
         }
         if ([IO.Path]::GetFullPath($path).TrimEnd('\', '/') -eq [IO.Path]::GetPathRoot($path).TrimEnd('\', '/')) {
-            Stop-Install 'Installation directories must be below a volume or share root. Hint: select dedicated private-data and config directories, not a filesystem root.'
+            Stop-Install 'Installation directories cannot be filesystem roots. Hint: select dedicated data and config directories.'
         }
         Assert-RealPath $path
     }
@@ -173,7 +173,7 @@ try {
     $release = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\', '/')
     foreach ($path in @($DataHome, $ConfigHome)) {
         if ($path.Equals($release, [StringComparison]::OrdinalIgnoreCase) -or $path.StartsWith($release + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            Stop-Install 'Runtime installation must be outside the expanded release. Hint: use the default private data and global config directories.'
+            Stop-Install 'Installation must be outside the expanded release. Hint: use the default data and config directories.'
         }
     }
     $pluginTarget = Join-Path $ConfigHome 'opencode/plugins/opencode-scheduler'
@@ -181,7 +181,7 @@ try {
     $binary = Join-Path $DataHome 'app/bin/opencode-scheduler.exe'
     foreach ($target in @($pluginTarget, $skillTarget)) {
         if ($DataHome.Equals($target, [StringComparison]::OrdinalIgnoreCase) -or $DataHome.StartsWith($target + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            Stop-Install 'Data-home overlaps a swapped plugin or skill directory. Hint: select a data directory outside both installed payload subtrees; no installation directories were created.'
+            Stop-Install 'Data-home overlaps a plugin or skill directory. Hint: choose a data directory outside both.'
         }
     }
     # The reused native installer stages/replaces the executable and may restart its
@@ -194,7 +194,7 @@ try {
         'schedules.sqlite3-shm', 'schedules.sqlite3-journal', 'product-install.json')) {
         $nativePath = Join-Path $DataHome $relative
         if ($ConfigHome.Equals($nativePath, [StringComparison]::OrdinalIgnoreCase) -or $ConfigHome.StartsWith($nativePath + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            Stop-Install 'Config-home overlaps a native executable or control-file path. Hint: use a dedicated config directory that does not occupy a native file path; no installation directories were created.'
+            Stop-Install 'Config-home overlaps a native file path. Hint: choose a separate config directory.'
         }
         Assert-RealPath $nativePath
         $privateFiles += $nativePath
@@ -212,29 +212,29 @@ try {
     Assert-RealTree $release
     foreach ($file in @('bin/opencode-scheduler.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'install.ps1') + @($pluginFiles | ForEach-Object { "plugin/$_" }) + @('skills/opencode-scheduler/SKILL.md')) {
         if (!(Test-Path -LiteralPath (Join-Path $release $file) -PathType Leaf)) {
-            Stop-Install 'Release payload is incomplete. Hint: expand the complete audited Windows x64 ZIP into a fresh directory and run its install.ps1.'
+            Stop-Install 'Release payload is incomplete. Hint: expand the complete Windows x64 ZIP into a fresh directory.'
         }
     }
     if (Test-Path -LiteralPath (Join-Path $release 'plugin/install.json')) {
-        Stop-Install 'Release contains private installation configuration. Hint: obtain a clean public release; do not distribute runtime configuration.'
+        Stop-Install 'Release contains private installation configuration. Hint: obtain a clean public release; do not share runtime configuration.'
     }
     $package = Read-Json (Join-Path $release 'plugin/package.json')
     if ($package.name -ne 'opencode-scheduler-plugin' -or $package.type -ne 'module' -or $package.exports.'.' -ne './dist/index.js') {
-        Stop-Install 'Plugin package entrypoint is invalid. Hint: use the complete audited release without editing its payload.'
+        Stop-Install 'Invalid plugin entrypoint. Hint: use an unmodified release.'
     }
     foreach ($field in @('dependencies', 'optionalDependencies', 'peerDependencies', 'bundledDependencies')) {
         if ($package.PSObject.Properties[$field] -and @($package.$field.PSObject.Properties).Count -gt 0) {
-            Stop-Install 'Plugin payload requires unshipped dependencies. Hint: obtain the standalone audited release.'
+            Stop-Install 'Plugin requires unshipped dependencies. Hint: obtain the standalone release.'
         }
     }
     $skillText = Get-Content -LiteralPath (Join-Path $release 'skills/opencode-scheduler/SKILL.md') -Raw
     if ($skillText -notmatch '(?m)^description: Use when explicitly' -or $skillText -notmatch '(?m)^  opencode/autoinvoke: false\r?$') {
-        Stop-Install 'Skill is not explicit-only. Hint: use the unmodified audited release; automatic scheduling is not enabled by this installer.'
+        Stop-Install 'Skill is not explicit-only. Hint: use an unmodified release.'
     }
     $sourceBinary = Join-Path $release 'bin/opencode-scheduler.exe'
     $version = & $sourceBinary --version 2>&1
     if ($LASTEXITCODE -ne 0 -or "$version" -notmatch '^opencode-scheduler \d+\.\d+\.\d+') {
-        Stop-Install 'Native payload could not be validated. Hint: use a trusted Windows x64 release compatible with this machine.'
+        Stop-Install 'Cannot validate native payload. Hint: use a trusted Windows x64 release.'
     }
     $manifestPath = Join-Path $DataHome 'product-install.json'
     Add-Type -AssemblyName Microsoft.VisualBasic
@@ -260,17 +260,17 @@ namespace SchedulerInstaller {
     $lockPath = Join-Path $ConfigHome 'opencode/.scheduler-install.lock'
     Assert-RealPath $lockPath
     New-Item -ItemType Directory -Path (Split-Path -Parent $lockPath) -Force | Out-Null
-    $script:problem = 'Another product installation may be running, or the config directory is not writable. Hint: let that installer finish and check directory access before retrying.'
+    $script:problem = 'Installation lock unavailable. Hint: let other installers finish and check config-directory write access.'
     $productLock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
     # Recheck after serialization; the initial check is what makes refusal no-write.
     foreach ($file in $privateFiles) { if (Test-Path -LiteralPath $file -PathType Leaf) { [void](Read-PrivateFileSecurity $file) } }
-    $script:problem = 'Installation preflight failed. Hint: check directory ownership, free space and installation metadata locally; preserve existing files.'
+    $script:problem = 'Installation preflight failed. Hint: preserve existing files; check ownership, free space and metadata locally.'
     $manifest = $null
     if (Test-Path -LiteralPath $manifestPath) {
         Assert-RealPath $manifestPath
         $manifest = Read-Json $manifestPath
         if ($manifest.protocol -ne 1 -or $manifest.plugin_path -ne $pluginTarget -or $manifest.skill_path -ne $skillTarget) {
-            Stop-Install 'Existing installation ownership does not match these directories. Hint: rerun with the original -DataHome and -ConfigHome; preserve existing files.'
+            Stop-Install 'Installation ownership does not match these directories. Hint: rerun with the original -DataHome and -ConfigHome.'
         }
     }
     $targets = @(@{ Name = 'plugin'; Path = $pluginTarget; Source = (Join-Path $release 'plugin'); Files = $pluginFiles }, @{ Name = 'skill'; Path = $skillTarget; Source = (Join-Path $release 'skills/opencode-scheduler'); Files = $skillFiles })
@@ -278,7 +278,7 @@ namespace SchedulerInstaller {
         Assert-RealTree $target.Path
         if (Test-Path -LiteralPath $target.Path) {
             if (!$manifest -and @(Get-ChildItem -LiteralPath $target.Path -Force).Count -gt 0) {
-                Stop-Install 'Existing plugin or skill has no installer ownership record. Hint: preserve the unfamiliar directory and resolve ownership before installing; nothing there will be overwritten.'
+                Stop-Install 'Existing plugin or skill has no ownership record. Hint: preserve the directory and resolve ownership before installing.'
             }
             foreach ($name in @($target.Files) + $(if ($target.Name -eq 'plugin') { 'install.json' })) {
                 $file = Join-Path $target.Path $name
@@ -286,7 +286,7 @@ namespace SchedulerInstaller {
                     $key = "$($target.Name)/$name"
                     $owned = $manifest.files.PSObject.Properties[$key]
                     if (!$owned -or (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $owned.Value) {
-                        Stop-Install 'An installer-managed file was modified or its ownership is unknown. Hint: preserve your edit and restore the original owned file before upgrading; unfamiliar user work is not overwritten.'
+                        Stop-Install 'Managed file was modified or ownership is unknown. Hint: preserve your edit and restore the original file before upgrading.'
                     }
                 }
             }
@@ -303,7 +303,7 @@ namespace SchedulerInstaller {
             $destination = Join-Path $stage $name
             New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
             Copy-Item -LiteralPath (Join-Path $target.Source $name) -Destination $destination -Force
-            if ((Get-FileHash -LiteralPath $destination).Hash -ne (Get-FileHash -LiteralPath (Join-Path $target.Source $name)).Hash) { Stop-Install 'Staged payload validation failed. Hint: check the disk and re-expand the trusted release before retrying.' }
+            if ((Get-FileHash -LiteralPath $destination).Hash -ne (Get-FileHash -LiteralPath (Join-Path $target.Source $name)).Hash) { Stop-Install 'Staged payload validation failed. Hint: check the disk and re-expand the trusted release.' }
         }
         $target.Stage = $stage
     }
@@ -314,14 +314,14 @@ namespace SchedulerInstaller {
     $env:XDG_CONFIG_HOME = $ConfigHome
     $nativeArgs = @('install', '--json')
     if ($NoPath) { $nativeArgs += '--no-path' }
-    $script:problem = 'Native installation failed. Hint: run opencode-scheduler status, inspect diagnostic.log locally and check ownership/free space; preserve the database and do not stop unrelated processes.'
+    $script:problem = 'Native installation failed. Hint: run opencode-scheduler status; inspect diagnostic.log locally and check ownership/free space. Preserve the database.'
     $nativeOutput = & $sourceBinary @nativeArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         $reply = "$nativeOutput" | ConvertFrom-Json
         if ($reply.error.message) { $script:problem = $reply.error.message }
         throw 'Native installation failed.'
     }
-    $script:problem = 'Native command is installed, but plugin/skill activation failed. Hint: preserve scheduler data and existing files, check directory access or files in use, then rerun this installer with the same directories.'
+    $script:problem = 'CLI installed, but plugin/skill activation failed. Hint: check directory access and files in use, then rerun with the same directories. Preserve existing data.'
     $hashes = @{}
     foreach ($target in $targets) {
         $names = @($target.Files) + $(if ($target.Name -eq 'plugin') { 'install.json' })
@@ -367,7 +367,7 @@ namespace SchedulerInstaller {
     # Complete product installation starts even a previously absent scheduler.
     # The returned status authenticates the installed daemon; host observation is
     # read-only and must not bootstrap or restart OpenCode.
-    $script:problem = 'Payload installed, but scheduler startup could not be verified. Hint: run opencode-scheduler status, then opencode-scheduler daemon start if absent; inspect diagnostic.log locally and preserve existing data.'
+    $script:problem = 'Payload installed; scheduler startup not verified. Hint: run opencode-scheduler status, then daemon start if absent. Inspect diagnostic.log locally if startup fails.'
     $startText = & $binary daemon start --json 2>$null
     if ($LASTEXITCODE -ne 0) { throw 'Scheduler startup failed.' }
     $started = $startText | ConvertFrom-Json
@@ -377,9 +377,9 @@ namespace SchedulerInstaller {
     $bin = Split-Path -Parent $binary
     $others = @($env:PATH -split ';' | Where-Object { $_.Trim().Trim('"').TrimEnd('\', '/') -ine $bin })
     $env:PATH = (@($bin) + $others) -join ';'
-    Write-Output 'Native command, plugin payload and explicit-only @opencode-scheduler skill installed. Existing schedules and unrelated configuration preserved.'
-    if (!$NoPath) { Write-Output 'This PowerShell process PATH is refreshed. Open a new terminal for other already-running shells; no OpenCode restart is needed.' }
-    else { Write-Output 'User PATH registration skipped; only this process PATH is refreshed. Other terminals need manual PATH management.' }
+    Write-Output 'Installed CLI, plugin payload and @opencode-scheduler skill.'
+    if (!$NoPath) { Write-Output 'PATH refreshed here; open a new terminal for other running shells.' }
+    else { Write-Output 'PATH refreshed here only; user PATH registration skipped.' }
     # Config/plugin directories are watched. Observe only; full location reload cancels
     # pending forms/permissions, so it is not an automatic installation step.
     $hostState = 'unknown'
@@ -391,8 +391,8 @@ namespace SchedulerInstaller {
         if ($hostState -eq 'active') { break }
         if ($attempt -lt 2) { Start-Sleep -Seconds 1 }
     }
-    if ($hostState -eq 'active') { Write-Output 'Plugin host: active in the queried host location. Explicit skill loading and actual tool invocation still require host acceptance checks.' }
-    else { Write-Output "Plugin host: $hostState (not loaded or not verified; installed payload is not full readiness). Hint: check OpenCode's plugin list and explicit disable policy in the intended location, wait for watched discovery and rerun opencode-scheduler status. No disable settings were changed and no host service was restarted." }
+    if ($hostState -eq 'active') { Write-Output 'Plugin host: active in the queried location.' }
+    else { Write-Output "Plugin host: $hostState. Hint: check the intended location's plugin list and disable policy; wait for discovery, then rerun opencode-scheduler status." }
 } catch {
     # Roll back completed payload operations only; native upgrade and data are retained.
     [array]::Reverse($backups)

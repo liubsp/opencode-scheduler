@@ -6,7 +6,7 @@ Set-StrictMode -Version Latest
 $root = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path $PSScriptRoot 'install.ps1'
 if (!$PayloadOnly -and !(Test-Path -LiteralPath $installer -PathType Leaf)) {
-    throw 'scripts/install.ps1 is required for a complete release. Use -PayloadOnly to build the audited staging payload.'
+    throw 'Release requires scripts/install.ps1. Use -PayloadOnly for staging without an installer.'
 }
 if ($env:OS -ne 'Windows_NT') { throw 'The release builder targets Windows x64 only.' }
 
