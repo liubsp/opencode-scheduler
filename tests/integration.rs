@@ -13,9 +13,75 @@ use std::{
 };
 use tempfile::TempDir;
 
-// These process-heavy chains share the host's bounded PowerShell startup budget.
+// These process-heavy chains share the host's bounded process startup budget.
 // Keep chains sequential; the singleton test still launches concurrent CLI starts itself.
 static CLI_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(windows)]
+#[test]
+fn native_private_child_prepares_only_the_literal_root_without_runtime_files() {
+    let home = TempDir::new().unwrap();
+    let root = home.path().join("missing parent").join("literal ' root");
+    let unrelated = home.path().join("not-the-root");
+    let output = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+        .arg("--internal-prepare-private-directory")
+        .arg(&root)
+        .env("OPENCODE_SCHEDULER_HOME", &unrelated)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    assert!(root.is_dir());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    assert!(!unrelated.exists());
+    let help = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("internal-prepare")
+    );
+    for args in [vec![], vec![root.as_os_str(), root.as_os_str()]] {
+        assert!(
+            !Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+                .arg("--internal-prepare-private-directory")
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_preparation_needs_no_shell_path_and_quotes_trailing_backslashes() {
+    let home = TempDir::new().unwrap();
+    let root = home.path().join("literal ' é root");
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+            .arg("--internal-prepare-private-directory")
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut trailing = root.as_os_str().to_os_string();
+    trailing.push("\\");
+    let output = Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+        .env("PATH", "")
+        .env("OPENCODE_SCHEDULER_HOME", trailing)
+        .args(["daemon", "stop", "--json"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Stop validates the existing root, then finds no daemon. It must get past
+    // preparation without a shell, preserve the literal path and never bootstrap.
+    assert_eq!(value["error"]["code"], "daemon_unavailable", "{value}");
+    assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+}
 
 #[test]
 fn malformed_time_is_rejected_before_private_directory_or_startup() {
@@ -358,7 +424,17 @@ async fn historical_errors_are_canonical_in_every_outward_envelope_without_rewri
             root: home.path().join("private"),
         };
         let _cleanup = DaemonCleanup(paths.root.clone());
+        #[cfg(not(windows))]
         paths.prepare().unwrap();
+        #[cfg(windows)]
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_opencode-scheduler"))
+                .arg("--internal-prepare-private-directory")
+                .arg(&paths.root)
+                .status()
+                .unwrap()
+                .success()
+        );
         let input = CreateInput {
             request_id: uuid::Uuid::new_v4().to_string(), target: TargetSelector::Id("ses_fixture".into()),
             at: "2099-11-06T05:00:00+01:00".into(),

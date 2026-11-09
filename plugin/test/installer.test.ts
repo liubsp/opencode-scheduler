@@ -283,7 +283,14 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
     if (existsSync(native)) await run(["daemon", "stop"]).catch(() => {});
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await rm(outside, { recursive: true, force: true });
+    // Endpoint removal precedes final process/handle release on Windows, as in
+    // the safety fixture. Bound cleanup retries without extending CLI deadlines.
+    await rm(outside, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
   });
   await assert.rejects(
     exec(

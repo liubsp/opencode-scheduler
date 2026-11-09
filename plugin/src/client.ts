@@ -53,9 +53,9 @@ const messages: Record<string, string> = {
   storage_busy:
     "Scheduler storage is locked by another writer. Hint: close external database writers and check opencode-scheduler status; preserve the database. For a lost create response reuse the same request ID and identical input.",
   private_directory_failure:
-    "Private data-directory preparation or security validation failed. Hint: check ownership, permissions and free disk space; use a real directory, not a link. Ensure PowerShell is available on Windows. Do not weaken ACLs or delete existing scheduler data.",
+    "Private data-directory preparation or security validation failed. Hint: check ownership, permissions and free disk space; use a real directory, not a link. On Windows, use a filesystem with persistent ACL support. Do not weaken ACLs or delete existing scheduler data.",
   private_directory_timeout:
-    "Private data-directory security helper exceeded its startup deadline. Hint: check host load and PowerShell availability, then run opencode-scheduler status. Permissions were not bypassed; preserve scheduler data and reuse the same request ID and identical input for a lost create response.",
+    "Private data-directory security helper exceeded its startup deadline. Hint: check host load and filesystem availability, then run opencode-scheduler status. Permissions were not bypassed; preserve scheduler data and reuse the same request ID and identical input for a lost create response.",
   daemon_startup_failure:
     "Scheduler daemon startup failed. Hint: inspect diagnostic.log locally and check private-directory access and free disk space; then run opencode-scheduler daemon start. Preserve scheduler data; reuse the same request ID and identical input for a lost create response.",
   daemon_startup_timeout:

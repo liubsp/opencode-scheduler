@@ -5,11 +5,12 @@ use crate::{
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(any(not(windows), test))]
+use std::process::{Command, Stdio};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::Duration,
 };
 use uuid::Uuid;
@@ -54,6 +55,7 @@ impl Paths {
     }
     pub fn prepare(&self) -> Result<(), ApiError> {
         let failure = || ApiError::coded("private_directory_failure");
+        #[cfg(not(windows))]
         if self.root.exists() {
             let meta = fs::symlink_metadata(&self.root).map_err(|_| failure())?;
             if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -62,25 +64,19 @@ impl Paths {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            // Use the OS ACL implementation, not a second home-grown Windows security model.
-            // Supply the ACL at directory creation: a concurrent validator must never observe
-            // an intermediate inherited/public ACL between mkdir and Set-Acl.
-            let script = r#"$ErrorActionPreference='Stop'; $p=$env:SCHEDULER_PRIVATE_ROOT; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; if(!(Test-Path -LiteralPath $p)){$a=New-Object Security.AccessControl.DirectorySecurity; $a.SetOwner($sid); $a.SetAccessRuleProtection($true,$false); $r=New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $a.AddAccessRule($r); $d=New-Object IO.DirectoryInfo($p); $d.Create($a)}; $i=Get-Item -LiteralPath $p; if($i.Attributes -band [IO.FileAttributes]::ReparsePoint){exit 2}; $a=Get-Acl -LiteralPath $p; if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){exit 3}; foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -ne $sid.Value){exit 4}}"#;
-            let mut child = Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                // PowerShell 7 callers export incompatible module search paths to
-                // native children. Let Windows PowerShell resolve its own ACL module.
-                .env_remove("PSModulePath")
-                .env("SCHEDULER_PRIVATE_ROOT", &self.root)
-                .creation_flags(0x08000000)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+            #[cfg(not(test))]
+            let mut child = crate::launch::spawn_private(
+                &std::env::current_exe().map_err(|_| failure())?,
+                &self.root,
+            )?;
+            #[cfg(test)]
+            let mut child = private_helper_command(&self.root)
+                .map_err(|_| failure())?
                 .spawn()
+                .map(crate::launch::Child::from)
                 .map_err(|_| failure())?;
             let status = wait_private_helper(&mut child, PRIVATE_HELPER_TIMEOUT)?;
-            if !status.success() {
+            if status != 0 {
                 return Err(failure());
             }
         }
@@ -108,15 +104,32 @@ impl Paths {
 }
 
 #[cfg(windows)]
-// Cold PowerShell startup can exceed five seconds under concurrent process-heavy work.
 // Keep security validation mandatory, bounded and separately observable from daemon startup.
 const PRIVATE_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(all(windows, test))]
+fn private_helper_command(root: &Path) -> std::io::Result<Command> {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            "runtime::tests::private_fixture_process",
+            "--nocapture",
+        ])
+        .env("SCHEDULER_PRIVATE_FIXTURE_ROOT", root)
+        .creation_flags(0x08000000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
+}
+
 #[cfg(windows)]
 fn wait_private_helper(
-    child: &mut std::process::Child,
+    child: &mut crate::launch::Child,
     timeout: Duration,
-) -> Result<std::process::ExitStatus, ApiError> {
+) -> Result<u32, ApiError> {
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -125,8 +138,7 @@ fn wait_private_helper(
                 std::thread::sleep(Duration::from_millis(20))
             }
             result => {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.kill_and_wait();
                 return Err(ApiError::coded(if result.is_err() {
                     "private_directory_failure"
                 } else {
@@ -588,24 +600,37 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn private_helper_allows_slow_startup_and_reaps_on_deadline() {
-        use std::os::windows::process::CommandExt;
-        let launch = |script: &str| {
-            Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                .creation_flags(0x08000000)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
-        };
-        let mut slow = launch("Start-Sleep -Milliseconds 5200");
-        assert!(
-            wait_private_helper(&mut slow, PRIVATE_HELPER_TIMEOUT)
-                .unwrap()
-                .success()
+    fn private_fixture_process() {
+        if std::env::var_os("SCHEDULER_PRIVATE_FIXTURE_HANG").is_some() {
+            std::thread::sleep(Duration::from_secs(120));
+        }
+        if let Some(root) = std::env::var_os("SCHEDULER_PRIVATE_FIXTURE_ROOT") {
+            std::process::exit(
+                if crate::windows_private::prepare(Path::new(&root)).is_ok() {
+                    0
+                } else {
+                    1
+                },
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_helper_completes_and_reaps_on_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = private_helper_command(&temp.path().join("private")).unwrap();
+        let mut slow = crate::launch::Child::from(command.spawn().unwrap());
+        assert_eq!(
+            wait_private_helper(&mut slow, PRIVATE_HELPER_TIMEOUT).unwrap(),
+            0
         );
-        let mut stuck = launch("Start-Sleep -Seconds 60");
+        let mut stuck = crate::launch::Child::from(
+            command
+                .env("SCHEDULER_PRIVATE_FIXTURE_HANG", "1")
+                .spawn()
+                .unwrap(),
+        );
         let error = wait_private_helper(&mut stuck, Duration::from_millis(50)).unwrap_err();
         assert_eq!(error.code, "private_directory_timeout");
         assert!(stuck.try_wait().unwrap().is_some());

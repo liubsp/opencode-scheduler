@@ -247,8 +247,31 @@ async fn execute(cli: Cli) -> Result<Value, ApiError> {
     let endpoint = runtime::ensure_daemon(&paths).await?;
     runtime::rpc(&endpoint, &operation).await
 }
-#[tokio::main]
-async fn main() {
+fn main() {
+    #[cfg(windows)]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref()
+            == Some(std::ffi::OsStr::new("--internal-prepare-private-directory"))
+        {
+            let root = args.next();
+            let success = root.is_some()
+                && args.next().is_none()
+                && opencode_scheduler::windows_private::prepare(std::path::Path::new(
+                    &root.unwrap(),
+                ))
+                .is_ok();
+            std::process::exit(if success { 0 } else { 1 });
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Cannot create scheduler runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let cli = Cli::parse();
     let json_output = cli.json;
     let daemon_run = matches!(&cli.command, Command::DaemonRun);
